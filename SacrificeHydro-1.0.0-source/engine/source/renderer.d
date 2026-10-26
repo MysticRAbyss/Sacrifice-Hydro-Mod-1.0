@@ -1,0 +1,6254 @@
+// copyright © tg
+// distributed under the terms of the gplv3 license
+// https://www.gnu.org/licenses/gpl-3.0.txt
+
+import dlib.math.portable;
+import dlib.math.vector, dlib.math.matrix, dlib.math.quaternion, dlib.math.transformation, dlib.math.utils: Axis, degtorad;
+import dlib.image.color;
+import std.stdio;
+import std.algorithm: min, max, among, map, filter, all, splitter, swap;
+import std.range: iota, walkLength, enumerate;
+import std.typecons: tuple, Tuple;
+import std.conv: to;
+import std.exception: enforce;
+import state,sacobject,sacspell,nttData,sacmap,levl,form,sacform,sacfont;
+import util;
+
+struct Camera{
+	int target=0;
+	float distance=6.0f;
+	float floatingHeight=2.0f;
+	float zoom=0.125f;
+	float targetZoom=0.125f;
+	float minimapZoom=2.7f;
+	float focusHeight;
+	bool centering=false;
+	enum rotationSpeed=0.95f*pi!float;
+	enum slowRotationSpeed=0.2f*pi!float;
+	float lastTargetFacing;
+
+	int width,height;
+	Vector3f position=Vector3f(1270.0f,1270.0f,2.0f);
+	float turn=0.0f,pitch=-90.0f,roll=0.0f; // TODO: use radians
+	float pitchOffset=0.0f;
+}
+
+struct Mouse(B){
+	float x,y;
+	float leftButtonX,leftButtonY;
+	bool visible,showFrame;
+	enum Status{
+		standard,
+		rectangleSelect,
+		xmenu,
+		icon,
+	}
+	bool dragging;
+	bool rotating;
+	Status status;
+	MouseIcon icon;
+	SacSpell!B spell;
+	bool additiveSelect=false;
+	auto cursor=Cursor.normal;
+	Target target;
+	Target xmenuTarget;
+	SacSpell!B targetSpell;
+	char[4] xmenuTargetId=0;
+	char[4] xmenuCenterTargetId=0;
+	char[4] xmenuMiddleTargetId=0;
+	float xmenuOffsetX=0,xmenuOffsetY=0;
+	int xmenuFrame;
+	bool xmenuVisible=false;
+	bool targetValid;
+	bool inHitbox=false;
+	int frame=0;
+	int targetUpdateFrame=0;
+	enum mouseoverBoxDelay=0.5f*updateFPS;
+	Target cachedTarget;
+	float cachedTargetX,cachedTargetY;
+	int cachedTargetFrame;
+	enum targetCacheDelta=10.0f;
+	enum minimapTargetCacheDelta=2.0f;
+	enum targetCacheDuration=3*updateFPS/4;
+	enum Location{
+		scene,
+		minimap,
+		selectionRoster,
+		spellbook,
+	}
+	Location loc;
+	bool menuMode;
+	@property bool onMinimap(){ return loc==Location.minimap; }
+	@property bool onSelectionRoster(){ return loc==Location.selectionRoster; }
+	@property bool onSpellbook(){ return loc==Location.spellbook; }
+}
+
+struct ActiveChatMessage{
+	int index;
+	int offset;
+	int height;
+	int frame;
+	bool fromNetwork;
+}
+struct ActiveChatMessages{
+	Array!ActiveChatMessage messages;
+	int[2] chatMessageIndex=0;
+	int chatMessageLowerBound=0;
+	bool[480] occupied=false;
+	int frame=0;
+	void update(){ frame+=1; }
+	void add(int index,int height,int topOffset,int gapSize,bool fromNetwork,int frame){
+		int offset=topOffset; // TODO: delay messages instead if nothing is found
+		int curGap=gapSize;
+		foreach(i,x;occupied){
+			if(x) curGap=0;
+			else ++curGap;
+			if(i>=topOffset+height&&curGap>=gapSize+height&&(i+1>=occupied.length||!occupied[i+1])){
+				occupied[i-height..i]=true;
+				offset=to!int(i-height);
+				break;
+			}
+		}
+		messages~=ActiveChatMessage(index,offset,height,frame,fromNetwork);
+	}
+	void remove(int localIndex){
+		occupied[messages[localIndex].offset..min(messages[localIndex].offset+messages[localIndex].height,$)]=false;
+		swap(messages[localIndex],messages[$-1]);
+		messages.length=messages.length-1;
+	}
+	void clearSidechannelMessages(){
+		for(int i=0;i<messages.length;){
+			if(messages[i].fromNetwork) remove(i);
+			else i++;
+		}
+	}
+}
+
+struct RenderInfo(B){
+	int renderSlot=-1;
+	int renderSide=-1;
+	float hudScaling;
+	int hudSoulFrame=0;
+	bool hudVisible=true;
+	bool minimapVisible=true;
+	Mouse!B mouse;
+	struct MouseSparkle{
+		float x,y;
+		int frame=0;
+	}
+	Array!MouseSparkle mouseSparkles;
+	Camera camera;
+	int windowWidth;
+	int windowHeight;
+	bool centerViewport=true;
+	@property int width(){ return camera.width; }
+	@property int height(){ return camera.height; }
+	@property int xOffset(){ return centerViewport ? (windowWidth-cast(int)(width*screenScaling))/2 : 0; }
+	@property int yOffset(){ return centerViewport ? (windowHeight-cast(int)(height*screenScaling))/2 : 0; }
+	float screenScaling;
+	auto spellbookTab=SpellType.creature;
+	ActiveChatMessages activeChatMessages;
+}
+
+struct Renderer(B){
+	SacSky!B sacSky;
+	void createSky(){
+		sacSky=new SacSky!B();
+	}
+	SacSoul!B sacSoul;
+	SacGreenSoul!B sacGreenSoul=null;
+	static struct SoulOpt{
+		bool refuseGreenSouls;
+	}
+	void createSouls(SoulOpt options){
+		sacSoul=new SacSoul!B();
+		if(!options.refuseGreenSouls)
+			sacGreenSoul=new SacGreenSoul!B();
+	}
+	SacObject!B sacDebris;
+	SacExplosion!B createExplosion(){
+		enum nU=4,nV=4;
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=1.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacExplosion!B(texture,mat,frames);
+	}
+	SacExplosion!B explosion;
+	SacBlueRing!B createBlueRing(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=20.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacBlueRing!B(texture,mat,frames);
+	}
+	SacBlueRing!B blueRing;
+	SacLevelUpRing!B createLevelUpRing(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=20.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacLevelUpRing!B(texture,mat,frames);
+	}
+	SacLevelUpRing!B levelUpRing;
+	SacLevelDownRing!B createLevelDownRing(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=20.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacLevelDownRing!B(texture,mat,frames);
+	}
+	SacLevelDownRing!B levelDownRing;
+	SacVortex!B createVortex(){
+		SacVortex!B result;
+		result.loadTextures();
+		result.rimMeshes=typeof(return).createRimMeshes();
+		result.redRimMat=B.makeMaterial(B.shadelessMaterialBackend);
+		result.redRimMat.depthWrite=false;
+		result.redRimMat.blending=B.Blending.Additive;
+		result.redRimMat.energy=10.0f;
+		result.redRimMat.diffuse=result.redRim;
+		result.blueRimMat=B.makeMaterial(B.shadelessMaterialBackend);
+		result.blueRimMat.depthWrite=false;
+		result.blueRimMat.blending=B.Blending.Additive;
+		result.blueRimMat.energy=10.0f;
+		result.blueRimMat.diffuse=result.blueRim;
+		result.centerMeshes=typeof(return).createCenterMeshes();
+		result.redCenterMat=B.makeMaterial(B.shadelessMaterialBackend);
+		result.redCenterMat.depthWrite=false;
+		result.redCenterMat.blending=B.Blending.Additive;
+		result.redCenterMat.energy=1.0f;
+		result.redCenterMat.diffuse=result.redCenter;
+		result.blueCenterMat=B.makeMaterial(B.shadelessMaterialBackend);
+		result.blueCenterMat.depthWrite=false;
+		result.blueCenterMat.blending=B.Blending.Additive;
+		result.blueCenterMat.energy=1.0f;
+		result.blueCenterMat.diffuse=result.blueCenter;
+		return result;
+	}
+	SacVortex!B vortex;
+	SacTether!B createTether(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessBoneMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=15.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacTether!B(texture,mat,frames);
+	}
+	SacTether!B tether;
+	SacGuardianTether!B createGuardianTether(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessBoneMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=5.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacGuardianTether!B(texture,mat,frames);
+	}
+	SacGuardianTether!B guardianTether;
+	SacLightning!B createLightning(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessBoneMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=15.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacLightning!B(texture,mat,frames);
+	}
+	SacLightning!B lightning;
+	SacWrath!B createWrath(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=20.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacWrath!B(texture,mat,frames);
+	}
+	SacWrath!B wrath;
+	SacCommandCone!B sacCommandCone;
+	SacHighlightStar!B highlightStar;
+	SacHighlightStar!B createHighlightStar(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=20.0f;
+		mat.diffuse=texture;
+		auto mesh=typeof(return).createMesh();
+		return SacHighlightStar!B(texture,mat,mesh);
+	}
+	SacObject!B rock;
+	SacBug!B bug;
+	SacBug!B createBug(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=1.0f;
+		mat.diffuse=texture;
+		auto mesh=typeof(return).createMesh();
+		return SacBug!B(texture,mat,mesh);
+	}
+	SacProtectiveBug!B protectiveBug;
+	SacProtectiveBug!B createProtectiveBug(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=1.0f;
+		mat.diffuse=texture;
+		auto meshes=typeof(return).createMeshes();
+		return SacProtectiveBug!B(texture,mat,meshes);
+	}
+	SacAirShield!B airShield;
+	SacAirShield!B createAirShield(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=5.0f;
+		mat.transparency=0.075f;
+		mat.diffuse=texture;
+		auto meshes=typeof(return).createMeshes;
+		return SacAirShield!B(texture,mat,meshes);
+	}
+	SacAirShieldEffect!B airShieldEffect;
+	SacAirShieldEffect!B createAirShieldEffect(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=10.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacAirShieldEffect!B(texture,mat,frames);
+	}
+	SacFreeze!B freeze;
+	SacFreeze!B createFreeze(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=5.0f;
+		mat.transparency=0.2f;
+		mat.diffuse=texture;
+		auto mesh=typeof(return).createMesh();
+		return SacFreeze!B(texture,mat,mesh);
+	}
+	SacSlime!B slime;
+	SacSlime!B createSlime(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.defaultMaterialBackend);
+		mat.specular=Color4f(1,1,1,1);
+		mat.roughness=1.0f;
+		mat.metallic=0.5f;
+		mat.diffuse=texture;
+		auto mesh=typeof(return).createMesh();
+		return SacSlime!B(texture,mat,mesh);
+	}
+	SacVine!B vine;
+	SacVine!B createVine(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.boneMaterialBackend);
+		mat.specular=Color4f(1,1,1,1);
+		mat.roughness=1.0f;
+		mat.metallic=0.5f;
+		mat.diffuse=texture;
+		auto mesh=typeof(return).createMesh();
+		return SacVine!B(texture,mat,mesh);
+	}
+	SacMeanstalk!B meanstalk;
+	SacMeanstalk!B createMeanstalk(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.boneMaterialBackend);
+		mat.specular=Color4f(1,1,1,1);
+		mat.roughness=1.0f;
+		mat.metallic=0.5f;
+		mat.diffuse=texture;
+		auto mesh=typeof(return).createMeanstalkMesh();
+		return SacMeanstalk!B(texture,mat,mesh);
+	}
+	SacRainbow!B rainbow;
+	SacRainbow!B createRainbow(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessBoneMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=10.0f;
+		mat.diffuse=texture;
+		auto mesh=typeof(return).createMesh();
+		return SacRainbow!B(texture,mat,mesh);
+	}
+	SacAnimateDead!B animateDead;
+	SacAnimateDead!B createAnimateDead(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessBoneMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=10.0f;
+		mat.diffuse=texture;
+		auto meshes=typeof(return).createMeshes();
+		return SacAnimateDead!B(texture,mat,meshes);
+	}
+	SacHellmouthProjectile!B hellmouthProjectile;
+	SacHellmouthProjectile!B createHellmouthProjectile(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessBoneMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=1.0f;
+		mat.diffuse=texture;
+		auto mesh=typeof(return).createMesh();
+		return SacHellmouthProjectile!B(texture,mat,mesh);
+	}
+	SacDragonfire!B dragonfire;
+	SacDragonfire!B createDragonfire(){
+		auto obj=typeof(return).create();
+		return SacDragonfire!B(obj);
+	}
+	SacSoulWind!B soulWind;
+	SacSoulWind!B createSoulWind(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=5.0f;
+		mat.transparency=0.75f;
+		mat.diffuse=texture;
+		auto meshes=typeof(return).createMeshes;
+		return SacSoulWind!B(texture,mat,meshes);
+	}
+	SacExplosionEffect!B explosionEffect;
+	SacExplosionEffect!B createExplosionEffect(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=8.0f;
+		mat.transparency=0.5f;
+		mat.diffuse=texture;
+		auto meshes=typeof(return).createMeshes;
+		return SacExplosionEffect!B(texture,mat,meshes);
+	}
+	SacCloud!B cloud;
+	SacCloud!B createCloud(){
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		import dlib.core.memory, dlib.image.unmanaged, dlib.image.render.shapes; // TODO: move to util?
+		auto img=New!UnmanagedImageRGBA8(8, 8);
+        img.fillColor(Color4f(0.0f,0.0f,0.0f,0.15f));
+        auto tex=New!(B.Texture)(img, mat);
+		mat.diffuse=tex;
+		auto meshes=typeof(return).createMeshes;
+		return SacCloud!B(mat,meshes);
+	}
+	SacCloud2!B cloud2;
+	SacCloud2!B createCloud2(){
+		auto blueMat=B.makeMaterial(B.shadelessMaterialBackend);
+		blueMat.depthWrite=false;
+		blueMat.blending=B.Blending.Transparent;
+		auto blueTex=typeof(return).loadBlueTexture();
+		blueMat.diffuse=blueTex;
+		blueMat.energy=20.0f;
+		blueMat.transparency=0.15f;
+		auto meshes=typeof(return).createMeshes;
+		return SacCloud2!B(blueMat,meshes);
+	}
+	SacVolcanoLava!B volcanoLava;
+	SacVolcanoLava!B createVolcanoLava(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.blending=B.Blending.Transparent;
+		mat.energy=10.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacVolcanoLava!B(texture,mat,frames);
+	}
+	SacVolcanoCloud!B volcanoCloud;
+	SacVolcanoCloud!B createVolcanoCloud(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.blending=B.Blending.Transparent;
+		mat.energy=1.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacVolcanoCloud!B(texture,mat,frames);
+	}
+	SacVolcanoSpatter!B volcanoSpatter;
+	SacVolcanoSpatter!B createVolcanoSpatter(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=10.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacVolcanoSpatter!B(texture,mat,frames);
+	}
+	SacTornado!B tornado;
+	SacTornado!B createTornado(){
+		auto texture=typeof(return).loadTexture();
+		auto texture2=typeof(return).loadTexture2();
+		auto texture3=typeof(return).loadTexture3();
+		auto mat=B.makeMaterial(B.shadelessColorMaterialBackend);
+		mat.blending=B.Blending.Transparent;
+		mat.energy=10.0f;
+		mat.transparency=0.9f;
+		mat.diffuse=texture;
+		auto mat2=B.makeMaterial(B.shadelessColorMaterialBackend);
+		mat2.blending=B.Blending.Transparent;
+		mat2.energy=10.0f;
+		mat2.transparency=0.9f;
+		mat2.diffuse=texture2;
+		auto mat3=B.makeMaterial(B.shadelessColorMaterialBackend);
+		mat3.depthWrite=false;
+		mat3.blending=B.Blending.Transparent;
+		mat3.energy=8.0f;
+		mat3.transparency=0.9f;
+		mat3.diffuse=texture3;
+		return SacTornado!B(texture,texture2,texture3,mat,mat2,mat3);
+	}
+	SacRainFrog!B rainFrog;
+	SacRainFrog!B createRainFrog(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=3.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacRainFrog!B(texture,mat,frames);
+	}
+	SacDemonicRiftSpirit!B demonicRiftSpirit;
+	SacDemonicRiftSpirit!B createDemonicRiftSpirit(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessBoneMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=20.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacDemonicRiftSpirit!B(texture,mat,frames);
+	}
+	SacDemonicRiftBorder!B demonicRiftBorder;
+	SacDemonicRiftBorder!B createDemonicRiftBorder(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=-3.0f;
+		//mat.transparency=0.75f;
+		mat.diffuse=texture;
+		auto meshes=typeof(return).createMeshes;
+		return SacDemonicRiftBorder!B(texture,mat,meshes);
+	}
+	SacDemonicRiftEffect!B demonicRiftEffect;
+	SacDemonicRiftEffect!B createDemonicRiftEffect(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=20.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacDemonicRiftEffect!B(texture,mat,frames);
+	}
+	SacHealingAura!B healingAura;
+	SacHealingAura!B createHealingAura(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=5.0f;
+		mat.transparency=0.075f;
+		mat.diffuse=texture;
+		auto meshes=typeof(return).createMeshes;
+		return SacHealingAura!B(texture,mat,meshes);
+	}
+	SacSpike!B spike;
+	SacSpike!B createSpike(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.defaultMaterialBackend);
+		mat.specular=Color4f(1,1,1,1);
+		mat.roughness=1.0f;
+		mat.metallic=0.5f;
+		mat.diffuse=texture;
+		auto mesh=typeof(return).createMesh();
+		return SacSpike!B(texture,mat,mesh);
+	}
+	SacFirewall!B firewall;
+	SacFirewall!B createFirewall(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessBoneMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=15.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacFirewall!B(texture,mat,frames);
+	}
+	SacWailingWallSpirit!B wailingWallSpirit;
+	SacWailingWallSpirit!B createWailingWallSpirit(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessBoneMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=20.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacWailingWallSpirit!B(texture,mat,frames);
+	}
+	SacWailingWall!B wailingWall;
+	SacWailingWall!B createWailingWall(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessBoneMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=1.0f;
+		mat.transparency=0.8f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacWailingWall!B(texture,mat,frames);
+	}
+	SacFence!B fence;
+	SacFence!B createFence(){
+		auto textures=typeof(return).loadTextures();
+		auto mat0=B.makeMaterial(B.shadelessMaterialBackend);
+		mat0.depthWrite=false;
+		mat0.blending=B.Blending.Transparent;
+		mat0.energy=1.0f;
+		mat0.diffuse=textures[0];
+		auto mat1=B.makeMaterial(B.shadelessMaterialBackend);
+		mat1.depthWrite=false;
+		mat1.blending=B.Blending.Additive;
+		mat1.energy=5.0f;
+		mat1.diffuse=textures[1];
+		auto frames=typeof(return).createMeshes();
+		return SacFence!B(textures,[mat0,mat1],frames);
+	}
+	SacIntestinalVaporization!B intestinalVaporization;
+	SacIntestinalVaporization!B createIntestinalVaporization(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=3.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacIntestinalVaporization!B(texture,mat,frames);
+	}
+	SacIntestinalVaporizationEffect!B intestinalVaporizationEffect;
+	SacIntestinalVaporizationEffect!B createIntestinalVaporizationEffect(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=3.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacIntestinalVaporizationEffect!B(texture,mat,frames);
+	}
+	SacBlindRage!B blindRage;
+	SacBlindRage!B createBlindRage(){
+		auto obj=typeof(return).create();
+		return SacBlindRage!B(obj);
+	}
+	SacBlindRageExplosion!B blindRageExplosion;
+	SacBlindRageExplosion!B createBlindRageExplosion(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=10.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacBlindRageExplosion!B(texture,mat,frames);
+	}
+	SacCow!B cow;
+	SacCow!B createCow(){
+		auto obj=typeof(return).create();
+		return SacCow!B(obj);
+	}
+	SacCharmHeart!B charmHeart;
+	SacCharmHeart!B createCharmHeart(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=24.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacCharmHeart!B(texture,mat,frames);
+	}
+	SacDeath!B death;
+	SacDeath!B createDeath(){
+		auto obj=typeof(return).create();
+		return SacDeath!B(obj);
+	}
+	SacDeathAura!B deathAura;
+	SacDeathAura!B createDeathAura(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=-0.25f/3.0f;
+		mat.diffuse=texture;
+		auto meshes=typeof(return).createMeshes;
+		return SacDeathAura!B(texture,mat,meshes);
+	}
+
+	SacBrainiacEffect!B brainiacEffect;
+	SacBrainiacEffect!B createBrainiacEffect(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=20.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacBrainiacEffect!B(texture,mat,frames);
+	}
+	SacShrikeEffect!B shrikeEffect;
+	SacShrikeEffect!B createShrikeEffect(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=15.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacShrikeEffect!B(texture,mat,frames);
+	}
+	B.Mesh whirlMesh; B.Material whirlMaterial; // Hydro mod: the Leviathan's whirlpool, a disc that lies on the ground
+	enum whirlRings=16, whirlSegments=64; // a round disc (a square one showed its corners as the texture turned)
+	void prepareWhirlpool(Vector3f center,float radius,float spin,ObjectState!B state){
+		enum nv=1+whirlRings*whirlSegments;
+		if(!whirlMesh){
+			import hydromod:hydroFx;
+			whirlMaterial=B.makeMaterial(B.shadelessMaterialBackend);
+			whirlMaterial.depthWrite=false;
+			whirlMaterial.blending=B.Blending.Transparent;
+			whirlMaterial.energy=1.0f;
+			whirlMaterial.diffuse=B.makeTexture(hydroFx("whirlpool.png"));
+			whirlMesh=B.makeMesh(nv,whirlSegments*(2*whirlRings-1));
+			int f=0;
+			uint at(int ring,int seg){ return 1+(ring-1)*whirlSegments+(seg%whirlSegments); }
+			foreach(sg;0..whirlSegments) whirlMesh.indices[f++]=[0,at(1,sg),at(1,sg+1)];
+			foreach(r;1..whirlRings) foreach(sg;0..whirlSegments){
+				whirlMesh.indices[f++]=[at(r,sg),at(r+1,sg),at(r+1,sg+1)];
+				whirlMesh.indices[f++]=[at(r,sg),at(r+1,sg+1),at(r,sg+1)];
+			}
+		}
+		void vertex(uint k,float u,float v){
+			auto p=center+radius*Vector3f(u,v,0.0f);
+			auto h=state.isOnGround(p)?state.getGroundHeight(p):state.getHeight(p);
+			whirlMesh.vertices[k]=Vector3f(radius*u,radius*v,h+0.15f-center.z);
+			// the texture turns, the disc stays put; the texture is round, so the disc only uses its inner circle
+			auto c=cos(spin), sn=sin(spin);
+			whirlMesh.texcoords[k]=Vector2f(0.5f+0.49f*(c*u-sn*v),0.5f+0.49f*(sn*u+c*v));
+		}
+		vertex(0,0.0f,0.0f);
+		foreach(r;1..whirlRings+1) foreach(sg;0..whirlSegments){
+			auto a=2.0f*pi!float*sg/whirlSegments, d=float(r)/whirlRings;
+			vertex(1+(r-1)*whirlSegments+sg,d*cos(a),d*sin(a));
+		}
+		whirlMesh.generateNormals();
+		B.finalizeMesh(whirlMesh);
+	}
+	static float fract(float x){ return x-floor(x); }
+	B.Material bubbleMat; // Hydro mod: Bubble Armor
+	B.Material bubbleArmorMaterial(){
+		if(bubbleMat) return bubbleMat;
+		import hydromod:hydroTint;
+		import txtr:loadTXTR;
+		bubbleMat=B.makeMaterial(B.shadelessMaterialBackend);
+		bubbleMat.depthWrite=false;
+		bubbleMat.blending=B.Blending.Transparent;
+		bubbleMat.energy=2.0f;
+		import hydromod:hydroFx;
+		bubbleMat.diffuse=B.makeTexture(hydroFx("bubbleskin.png")); // a thin, shimmering film of water
+		return bubbleMat;
+	}
+	B.Material undertowMat, algaeMat; // Hydro mod: Undertow's whirlpool and seaweed
+	B.Mesh algaeMesh;
+	B.Material springMat, coralMat, waterfallMat, domeMat; // Hydro mod: Healing Spring, Tidal Wall, Geyser
+	B.Mesh domeMesh;
+	void prepareDome(ref Erupt!B erupt,ObjectState!B state){ // the Geyser's swelling dome of water
+		enum N=25;
+		if(!domeMesh){
+			domeMesh=B.makeMesh(N*N,2*(N-1)*(N-1));
+			int f=0;
+			foreach(j;0..N-1) foreach(i;0..N-1){
+				uint a=j*N+i;
+				domeMesh.indices[f++]=[a,a+1,a+N+1];
+				domeMesh.indices[f++]=[a,a+N+1,a+N];
+			}
+		}
+		auto radius=erupt.spell.effectRange*1.05f;
+		auto center=erupt.position;
+		auto wobble=0.15f*sin(erupt.frame*0.35f);
+		foreach(j;0..N) foreach(i;0..N){
+			auto u=2.0f*i/(N-1)-1.0f, v=2.0f*j/(N-1)-1.0f;
+			auto p=center+radius*Vector3f(u,v,0.0f);
+			auto h=state.isOnGround(p)?state.getGroundHeight(p):state.getHeight(p);
+			auto d=radius*sqrt(u*u+v*v);
+			auto dome=geyserDome(erupt,d);
+			domeMesh.vertices[j*N+i]=Vector3f(radius*u,radius*v,h+0.1f+dome*(1.0f+wobble*(1.0f-d/radius))-center.z);
+			domeMesh.texcoords[j*N+i]=Vector2f(0.5f+0.5f*u,0.5f+0.5f*v+0.02f*erupt.frame/60.0f);
+		}
+		domeMesh.generateNormals();
+		B.finalizeMesh(domeMesh);
+	}
+	B.Mesh coralMesh;
+	B.Material bubbleSpriteMat; B.Mesh bubbleSpriteMesh; // Hydro mod: Bubble Armor's bubbles
+	B.Material waterfallMaterial(){
+		if(waterfallMat) return waterfallMat;
+		import hydromod:hydroFx;
+		waterfallMat=B.makeMaterial(B.shadelessBoneMaterialBackend);
+		waterfallMat.depthWrite=false;
+		waterfallMat.blending=B.Blending.Transparent;
+		waterfallMat.energy=1.4f;
+		waterfallMat.diffuse=B.makeTexture(hydroFx("waterfall.png"));
+		return waterfallMat;
+	}
+	B.Material fxMaterial(ref B.Material m,string name){
+		if(m) return m;
+		import hydromod:hydroFx;
+		m=B.makeMaterial(B.shadelessMaterialBackend);
+		m.depthWrite=false;
+		m.blending=B.Blending.Transparent;
+		m.energy=name=="algae.png"?1.35f:1.0f;
+		m.diffuse=B.makeTexture(hydroFx(name));
+		return m;
+	}
+	// --- Hydro mod: Acid Rain, Tsunami and Kraken ---
+	B.Material acidPoolMat, acidCloudMat, acidDropMat, waveMat, tentacleMat;
+	B.Mesh acidCloudMesh, acidDropMesh, waveMesh, tentacleMesh;
+	B.Material tentacleMaterial(){
+		if(tentacleMat) return tentacleMat;
+		import hydromod:hydroFx;
+		tentacleMat=B.makeMaterial(B.shadelessMaterialBackend);
+		tentacleMat.energy=1.2f;
+		tentacleMat.diffuse=B.makeTexture(hydroFx("tentacle.png"));
+		return tentacleMat;
+	}
+	enum waveNX=24, waveNP=10;
+	static immutable float[2][waveNP] waveProfile=[ // (along, height) from the back foot over the crest to the front foot
+		[-14.0f,0.0f],[-9.0f,1.2f],[-5.0f,3.2f],[-2.2f,5.4f],[-0.4f,6.8f],[0.9f,7.1f],[1.8f,6.2f],[1.7f,4.2f],[1.1f,2.0f],[0.6f,0.0f]];
+	void prepareWave(ref VortexEffect!B vortex,ObjectState!B state){
+		if(!waveMesh){
+			waveMesh=B.makeMesh(waveNX*waveNP,2*(waveNX-1)*(waveNP-1));
+			int f=0;
+			foreach(j;0..waveNP-1) foreach(i;0..waveNX-1){
+				uint a=j*waveNX+i;
+				waveMesh.indices[f++]=[a,a+1,a+waveNX+1];
+				waveMesh.indices[f++]=[a,a+waveNX+1,a+waveNX];
+			}
+		}
+		auto dir=Vector3f(vortex.hydroDir.x,vortex.hydroDir.y,0.0f), side=Vector3f(-vortex.hydroDir.y,vortex.hydroDir.x,0.0f);
+		auto dist=tsunamiProgress(vortex);
+		auto front=vortex.position+dist*dir;
+		auto t=float(vortex.frame)/updateFPS;
+		auto grow=min(1.0f,t/0.6f)*(dist<tsunamiTravel?1.0f:max(0.0f,1.0f-(t-tsunamiTravel/tsunamiSpeed)/0.8f));
+		foreach(j;0..waveNP) foreach(i;0..waveNX){
+			auto u=float(i)/(waveNX-1);
+			auto across=(u-0.5f)*tsunamiWidth;
+			auto edge=min(1.0f,(0.5f-abs(u-0.5f))*6.0f); // lower towards the ends
+			auto wob=0.4f*sin(across*0.35f+t*3.0f);
+			auto p=front+across*side+(waveProfile[j][0]*(tsunamiHeight/7.0f)+wob*(j>3&&j<8?1.0f:0.0f))*dir;
+			auto ground=state.isOnGround(p)?state.getGroundHeight(p):state.getHeight(p);
+			auto h=ground+waveProfile[j][1]*(tsunamiHeight/7.0f)*grow*(0.35f+0.65f*edge)+0.1f;
+			waveMesh.vertices[j*waveNX+i]=Vector3f(p.x,p.y,h)-front;
+			waveMesh.texcoords[j*waveNX+i]=Vector2f(u*3.0f+0.15f*t,float(j)/(waveNP-1));
+		}
+		waveMesh.generateNormals();
+		B.finalizeMesh(waveMesh);
+	}
+	// the Kraken's tentacles follow the curves of Meanstalks vines: a thick arm tapering to a flat,
+	// leaf-shaped club lined with suckers, with a row of spines along its back
+	enum tentRings=40, tentSides=12, tentSpines=16;
+	void prepareTentacle(ref Meanstalk vine,float s){
+		enum nv=tentRings*tentSides+tentSpines*4, nf=(tentRings-1)*tentSides*2+tentSpines*3;
+		if(!tentacleMesh){
+			tentacleMesh=B.makeMesh(nv,nf);
+			int f=0;
+			foreach(r;0..tentRings-1) foreach(q;0..tentSides){
+				uint a0=r*tentSides+q, a1=r*tentSides+(q+1)%tentSides;
+				tentacleMesh.indices[f++]=[a0,a1,a1+tentSides];
+				tentacleMesh.indices[f++]=[a0,a1+tentSides,a0+tentSides];
+			}
+			foreach(k;0..tentSpines){
+				uint b=tentRings*tentSides+k*4;
+				tentacleMesh.indices[f++]=[b,b+1,b+3];
+				tentacleMesh.indices[f++]=[b+1,b+2,b+3];
+				tentacleMesh.indices[f++]=[b+2,b,b+3];
+			}
+		}
+		Vector3f bez(Vector3f[4] c,float u){ auto v=1.0f-u; return v*v*v*c[0]+3.0f*v*v*u*c[1]+3.0f*v*u*u*c[2]+u*u*u*c[3]; }
+		Vector3f point(float t){ return t<=0.5f?bez(vine.curve0,2.0f*t):bez(vine.curve1,2.0f*t-1.0f); }
+		Vector3f[tentRings] pts, tans, n1s, n2s; float[tentRings] wid, thk;
+		foreach(r;0..tentRings){
+			auto t=float(r)/(tentRings-1);
+			pts[r]=point(t);
+			auto t0=max(0.0f,t-0.01f), t1=min(1.0f,t+0.01f);
+			auto tan=point(t1)-point(t0);
+			tans[r]=tan.lengthsqr>1e-8f?tan.normalized:Vector3f(0.0f,0.0f,1.0f);
+			auto refv=vine.framevec.lengthsqr>1e-6f?vine.framevec:Vector3f(1.0f,0.0f,0.0f);
+			auto n1=cross(tans[r],refv); if(n1.lengthsqr<1e-6f) n1=cross(tans[r],Vector3f(0.0f,1.0f,0.0f));
+			n1s[r]=n1.normalized; n2s[r]=cross(n1s[r],tans[r]).normalized; // n2: the back (spines), -n2: the suckers
+			enum club=0.72f;
+			if(t<club){ wid[r]=thk[r]=s*(2.6f-1.9f*t/club); }
+			else{ // the leaf: widens, flattens, then comes to a point
+				auto c=(t-club)/(1.0f-club);
+				wid[r]=s*(0.7f+2.1f*sin(pi!float*min(1.0f,c*1.25f))*(1.0f-c)+0.05f);
+				thk[r]=s*(0.7f*(1.0f-c)+0.05f);
+			}
+		}
+		foreach(r;0..tentRings) foreach(q;0..tentSides){
+			auto ang=2.0f*pi!float*q/tentSides;
+			auto idx=r*tentSides+q;
+			tentacleMesh.vertices[idx]=pts[r]+wid[r]*cos(ang)*n1s[r]+thk[r]*sin(ang)*n2s[r];
+			tentacleMesh.texcoords[idx]=Vector2f(float(q)/tentSides,float(r)/(tentRings-1));
+		}
+		foreach(k;0..tentSpines){ // spines along the back, leaning towards the tip
+			auto r=2+k*(tentRings-5)/tentSpines;
+			auto base=pts[r]+thk[r]*0.9f*n2s[r];
+			auto len=s*(1.2f+1.4f*(1.0f-float(r)/tentRings));
+			auto b=tentRings*tentSides+k*4;
+			auto w=0.35f*len;
+			tentacleMesh.vertices[b]=base+w*n1s[r];
+			tentacleMesh.vertices[b+1]=base-w*n1s[r];
+			tentacleMesh.vertices[b+2]=base-w*tans[r];
+			tentacleMesh.vertices[b+3]=base+len*(0.8f*n2s[r]+0.6f*tans[r]);
+			foreach(m;0..4) tentacleMesh.texcoords[b+m]=Vector2f(0.0f,0.02f);
+		}
+		tentacleMesh.generateNormals();
+		B.finalizeMesh(tentacleMesh);
+	}
+	void renderHydroBig(ref VortexEffect!B effect,ObjectState!B state,B.RenderContext rc){
+		import hydromod:hydroFx;
+		auto total=effect.duration*updateFPS;
+		auto fade=min(1.0f,effect.frame/(0.6f*updateFPS),max(0.0f,(total-effect.frame)/(1.0f*updateFPS)));
+		auto radius=effect.rangedAttack.effectRange;
+		switch(effect.hydroBig){
+			case HydroBig.acidRain:
+				// the stained ground
+				prepareWhirlpool(effect.position,radius,0.0f,state);
+				auto pool=fxMaterial(acidPoolMat,"acidpool.png");
+				pool.bind(rc);
+				B.disableCulling();
+				B.shadelessMaterialBackend.setTransformationScaled(effect.position,Quaternionf.identity(),Vector3f(1.0f,1.0f,1.0f),rc);
+				B.shadelessMaterialBackend.setAlpha(0.8f*fade);
+				whirlMesh.render(rc);
+				B.enableCulling();
+				pool.unbind(rc);
+				// the drops
+				auto dmat=fxMaterial(acidDropMat,"acid.png");
+				if(!acidDropMesh) acidDropMesh=makeSpriteMeshes!B(1,1,0.18f,0.7f)[0];
+				dmat.bind(rc);
+				foreach(ref particle;effect.particles.data){
+					B.shadelessMaterialBackend.setSpriteTransformationScaled(effect.position+particle.position,particle.scale,rc);
+					B.shadelessMaterialBackend.setAlpha(fade);
+					acidDropMesh.render(rc);
+				}
+				dmat.unbind(rc);
+				// the cloud
+				auto cmat=fxMaterial(acidCloudMat,"acidcloud.png");
+				if(!acidCloudMesh) acidCloudMesh=makeSpriteMeshes!B(1,1,1.0f,1.0f)[0];
+				cmat.bind(rc);
+				foreach(k;0..9){
+					auto a=k*2.4f+0.05f*effect.frame/updateFPS;
+					auto rr=(k==0?0.0f:(0.35f+0.3f*(k%3))*radius);
+					auto p=effect.position+Vector3f(rr*cos(a),rr*sin(a),acidCloudHeight+1.5f+0.8f*sin(k*1.3f));
+					B.shadelessMaterialBackend.setSpriteTransformationScaled(p,radius*(0.75f+0.1f*(k%4)),rc);
+					B.shadelessMaterialBackend.setAlpha(0.85f*fade);
+					acidCloudMesh.render(rc);
+				}
+				cmat.unbind(rc);
+				break;
+			case HydroBig.tsunami:
+				prepareWave(effect,state);
+				auto dir=Vector3f(effect.hydroDir.x,effect.hydroDir.y,0.0f);
+				auto front=effect.position+tsunamiProgress(effect)*dir;
+				auto wmat=fxMaterial(waveMat,"wave.png");
+				wmat.bind(rc);
+				B.disableCulling();
+				B.shadelessMaterialBackend.setTransformationScaled(front,Quaternionf.identity(),Vector3f(1.0f,1.0f,1.0f),rc);
+				B.shadelessMaterialBackend.setAlpha(1.0f);
+				waveMesh.render(rc);
+				B.enableCulling();
+				wmat.unbind(rc);
+				break;
+			case HydroBig.kraken:
+				prepareWhirlpool(effect.position,radius*min(1.0f,0.4f+effect.frame/(1.0f*updateFPS)),effect.spin,state);
+				whirlMaterial.bind(rc);
+				B.disableCulling();
+				B.shadelessMaterialBackend.setTransformationScaled(effect.position,Quaternionf.identity(),Vector3f(1.0f,1.0f,1.0f),rc);
+				B.shadelessMaterialBackend.setAlpha(0.95f*fade);
+				whirlMesh.render(rc);
+				whirlMaterial.unbind(rc);
+				B.enableCulling();
+				break;
+			default: break;
+		}
+	}
+	B.Material[string] hydroMaterials; // Hydro mod: sea-blue copies of effect materials
+	B.Material hydroMaterial(string path,float energy){
+		if(auto m=path in hydroMaterials) return *m;
+		import hydromod:hydroTint;
+		import txtr:loadTXTR;
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=energy;
+		mat.diffuse=B.makeTexture(hydroTint(loadTXTR(path)));
+		return hydroMaterials[path]=mat;
+	}
+	bool isBoltId(int id,ObjectState!B state){ // Hydro mod: creatures whose ranged attack is a water bolt
+		import hydromod:hydroBoltCreatures;
+		return state.movingObjectById!((ref o)=>!!(o.sacObject.nttTag in hydroBoltCreatures),()=>false)(id);
+	}
+	B.Material boltMat;
+	B.Mesh boltMesh;
+	bool isHydroId(int id,ObjectState!B state){
+		import hydromod:isHydroCreature;
+		return state.movingObjectById!((ref o)=>isHydroCreature(o.sacObject.nttTag),()=>false)(id);
+	}
+	SacArrow!B arrow;
+	SacArrow!B createArrow(){
+		auto sylphTexture=typeof(return).loadSylphTexture();
+		auto smat=B.makeMaterial(B.shadelessMaterialBackend);
+		smat.depthWrite=false;
+		smat.blending=B.Blending.Additive;
+		smat.energy=30.0f;
+		smat.diffuse=sylphTexture;
+		auto rangerTexture=typeof(return).loadRangerTexture();
+		auto rmat=B.makeMaterial(B.shadelessMaterialBackend);
+		rmat.depthWrite=false;
+		rmat.blending=B.Blending.Additive;
+		rmat.energy=45.0f;
+		rmat.diffuse=rangerTexture;
+		auto frames=typeof(return).createMeshes();
+		return SacArrow!B(sylphTexture,smat,rangerTexture,rmat,frames);
+	}
+	SacLaser!B laser;
+	SacLaser!B createLaser(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessBoneMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=15.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacLaser!B(texture,mat,frames);
+	}
+	SacBeam!B magnifryerBeam;
+	SacBeam!B createMagnifryerBeam(){
+		int nU,nV;
+		auto texture=typeof(return).loadTexture(nU,nV);
+		auto mat=B.makeMaterial(B.shadelessBoneMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=15.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes(nU,nV);
+		return SacBeam!B(texture,mat,frames,nU*nV*updateAnimFactor);
+	}
+	SacBasiliskEffect!B basiliskEffect;
+	SacBasiliskEffect!B createBasiliskEffect(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=20.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacBasiliskEffect!B(texture,mat,frames);
+	}
+	SacTube!B tube;
+	SacTube!B createTube(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=20.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacTube!B(texture,mat,frames);
+	}
+	SacVortexEffect!B vortexEffect;
+	SacVortexEffect!B createVortexEffect(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=20.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacVortexEffect!B(texture,mat,frames);
+	}
+	SacSquallEffect!B squallEffect;
+	SacSquallEffect!B createSquallEffect(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=20.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacSquallEffect!B(texture,mat,frames);
+	}
+	SacPyromaniacRocket!B pyromaniacRocket;
+	SacPyromaniacRocket!B createPyromaniacRocket(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=3.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacPyromaniacRocket!B(texture,mat,frames);
+	}
+	SacGnomeEffect!B gnomeEffect;
+	SacGnomeEffect!B createGnomeEffect(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=10.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacGnomeEffect!B(texture,mat,frames);
+	}
+	SacWarmongerEffect!B warmongerEffect;
+	SacWarmongerEffect!B createWarmongerEffect(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=10.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacWarmongerEffect!B(texture,mat,frames);
+	}
+	SacPoisonDart!B poisonDart;
+	SacPoisonDart!B createPoisonDart(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=3.0f;
+		mat.diffuse=texture;
+		auto mesh=typeof(return).createMesh();
+		return SacPoisonDart!B(texture,mat,mesh);
+	}
+	SacLifeShield!B lifeShield;
+	SacLifeShield!B createLifeShield(){
+		import txtr;
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=10.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacLifeShield!B(texture,mat,frames);
+	}
+	SacDivineSight!B divineSight;
+	SacDivineSight!B createDivineSight(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=3.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacDivineSight!B(texture,mat,frames);
+	}
+	SacBlightMite!B blightMite;
+	SacBlightMite!B createBlightMite(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=3.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacBlightMite!B(texture,mat,frames);
+	}
+	SacCord!B cord;
+	SacCord!B createCord(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=3.0f;
+		mat.diffuse=texture;
+		auto mesh=typeof(return).createMesh();
+		return SacCord!B(texture,mat,mesh);
+	}
+	SacWeb!B web;
+	SacWeb!B createWeb(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=3.0f;
+		mat.diffuse=texture;
+		auto mesh=typeof(return).createMesh();
+		return SacWeb!B(texture,mat,mesh);
+	}
+	SacCage!B cage;
+	SacCage!B createCage(){
+		import txtr;
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=10.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacCage!B(texture,mat,frames);
+	}
+	SacStickyBomb!B stickyBomb;
+	SacStickyBomb!B createStickyBomb(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=3.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacStickyBomb!B(texture,mat,frames);
+	}
+	SacOil!B oil;
+	SacOil!B createOil(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=3.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacOil!B(texture,mat,frames);
+	}
+	SacMutantProjectile!B mutantProjectile;
+	SacMutantProjectile!B createMutantProjectile(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=3.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacMutantProjectile!B(texture,mat,frames);
+	}
+	SacAbominationProjectile!B abominationProjectile;
+	SacAbominationProjectile!B createAbominationProjectile(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=3.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacAbominationProjectile!B(texture,mat,frames);
+	}
+	SacBombardProjectile!B bombardProjectile;
+	SacBombardProjectile!B createBombardProjectile(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=20.0f;
+		mat.diffuse=texture;
+		auto frames=typeof(return).createMeshes();
+		return SacBombardProjectile!B(texture,mat,frames);
+	}
+	SacFlurryProjectile!B flurryProjectile;
+	SacFlurryProjectile!B createFlurryProjectile(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=20.0f;
+		mat.diffuse=texture;
+		auto mesh=typeof(return).createMesh();
+		return SacFlurryProjectile!B(texture,mat,mesh);
+	}
+	SacFlurryImplosion!B flurryImplosion;
+	SacFlurryImplosion!B createFlurryImplosion(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Additive;
+		mat.energy=0.5f;
+		mat.diffuse=texture;
+		auto mesh=typeof(return).createMesh();
+		return SacFlurryImplosion!B(texture,mat,mesh);
+	}
+	SacObject!B snowball;
+	SacFrozenGround!B frozenGround;
+	SacFrozenGround!B createFrozenGround(){
+		auto texture=typeof(return).loadTexture();
+		auto mat=B.makeMaterial(B.shadelessMaterialBackend);
+		mat.depthWrite=false;
+		mat.blending=B.Blending.Transparent;
+		mat.energy=10.0f;
+		mat.transparency=0.2f;
+		mat.diffuse=texture;
+		auto mesh=typeof(return).createMesh();
+		return SacFrozenGround!B(texture,mat,mesh);
+	}
+	void createEffects(){
+		import std.traits:EnumMembers;
+		foreach(ptype;EnumMembers!ParticleType) SacParticle!B.get(ptype);
+		sacCommandCone=new SacCommandCone!B();
+		highlightStar=createHighlightStar();
+		sacDebris=new SacObject!B("extracted/models/MODL.WAD!/bold.MRMC/bold.MRMM");
+		enforce(sacDebris.meshes.length==1);
+		explosion=createExplosion();
+		blueRing=createBlueRing();
+		levelUpRing=createLevelUpRing();
+		levelDownRing=createLevelDownRing();
+		vortex=createVortex();
+		tether=createTether();
+		guardianTether=createGuardianTether();
+		lightning=createLightning();
+		wrath=createWrath();
+		rock=new SacObject!B("extracted/models/MODL.WAD!/rock.MRMC/rock.MRMM");
+		enforce(rock.meshes.length==1);
+		bug=createBug();
+		protectiveBug=createProtectiveBug();
+		airShield=createAirShield();
+		airShieldEffect=createAirShieldEffect();
+		freeze=createFreeze();
+		spike=createSpike();
+		firewall=createFirewall();
+		wailingWallSpirit=createWailingWallSpirit();
+		wailingWall=createWailingWall();
+		fence=createFence();
+		intestinalVaporization=createIntestinalVaporization();
+		intestinalVaporizationEffect=createIntestinalVaporizationEffect();
+		blindRage=createBlindRage();
+		blindRageExplosion=createBlindRageExplosion();
+		cow=createCow();
+		charmHeart=createCharmHeart();
+		death=createDeath();
+		deathAura=createDeathAura();
+		brainiacEffect=createBrainiacEffect();
+		shrikeEffect=createShrikeEffect();
+		arrow=createArrow();
+		laser=createLaser();
+		magnifryerBeam=createMagnifryerBeam();
+		basiliskEffect=createBasiliskEffect();
+		tube=createTube();
+		vortexEffect=createVortexEffect();
+		squallEffect=createSquallEffect();
+		pyromaniacRocket=createPyromaniacRocket();
+		gnomeEffect=createGnomeEffect();
+		warmongerEffect=createWarmongerEffect();
+		poisonDart=createPoisonDart();
+		lifeShield=createLifeShield();
+		divineSight=createDivineSight();
+		blightMite=createBlightMite();
+		cord=createCord();
+		web=createWeb();
+		cage=createCage();
+		stickyBomb=createStickyBomb();
+		oil=createOil();
+		slime=createSlime();
+		vine=createVine();
+		meanstalk=createMeanstalk();
+		rainbow=createRainbow();
+		animateDead=createAnimateDead();
+		hellmouthProjectile=createHellmouthProjectile();
+		dragonfire=createDragonfire();
+		soulWind=createSoulWind();
+		explosionEffect=createExplosionEffect();
+		cloud=createCloud();
+		cloud2=createCloud2();
+		volcanoLava=createVolcanoLava();
+		volcanoCloud=createVolcanoCloud();
+		volcanoSpatter=createVolcanoSpatter();
+		tornado=createTornado();
+		rainFrog=createRainFrog();
+		demonicRiftSpirit=createDemonicRiftSpirit();
+		demonicRiftBorder=createDemonicRiftBorder();
+		demonicRiftEffect=createDemonicRiftEffect();
+		healingAura=createHealingAura();
+		mutantProjectile=createMutantProjectile();
+		abominationProjectile=createAbominationProjectile();
+		bombardProjectile=createBombardProjectile();
+		flurryProjectile=createFlurryProjectile();
+		flurryImplosion=createFlurryImplosion();
+		snowball=new SacObject!B("extracted/models/MODL.WAD!/sbll.MRMC/sbll.MRMM");
+		frozenGround=createFrozenGround();
+	}
+
+	static struct InitOpt{
+		bool freetypeFonts;
+		bool refuseGreenSouls;
+	}
+	void initialize(InitOpt options){
+		createSky();
+		SoulOpt soulOpt={refuseGreenSouls: options.refuseGreenSouls};
+		createSouls(soulOpt);
+		createEffects();
+		HudOpt hudOpt={freetypeFonts: options.freetypeFonts};
+		initializeHUD(hudOpt);
+	}
+
+	struct EnvOpt{
+		float sunFactor;
+		float ambientFactor;
+		bool enableFog;
+	}
+
+	void setupEnvironment(EnvOpt options,SacMap!B map){
+		auto env=B.environment; // TODO: get rid of this?
+		auto envi=&map.envi;
+		//writeln(envi.sunDirectStrength," ",envi.sunAmbientStrength);
+		float sunStrength;
+		final switch(map.tileset) with(Tileset){
+			case ethereal: sunStrength=6.0f; break;
+			case persephone: sunStrength=6.0f; break;
+			case pyro: sunStrength=2.0f; break;
+			case james: sunStrength=14.0f; break;
+			case stratos: sunStrength=12.0f; break;
+			case charnel: sunStrength=4.0f; break;
+		}
+		env.sunEnergy=min(sunStrength*envi.sunDirectStrength,30.0f)*options.sunFactor;
+		static Color4f fixColor(Color4f sacColor){
+			return Color4f(0,0.3,1,1)*0.2+sacColor*0.8;
+		}
+		//env.ambientConstant = fixColor(Color4f(envi.ambientRed*ambi,envi.ambientGreen*ambi,envi.ambientBlue*ambi,1.0f));
+		auto ambi=envi.sunAmbientStrength;
+		//auto ambi=1.5f*envi.sunAmbientStrength;
+		//env.ambientConstant = fixColor(Color4f(envi.sunColorRed/255.0f*ambi,envi.sunColorGreen/255.0f*ambi,envi.sunColorBlue/255.0f*ambi,1.0f));
+		Color4f capColor(Color4f sacColor){
+			return Color4f(max(0.0f,min(sacColor.r,1.0f)),max(0.0f,min(sacColor.g,1.0f)),max(0.0f,min(sacColor.b,1.0f)),max(0.0f,min(sacColor.a,1.0f)));
+		}
+		env.ambientConstant = Color4f(options.ambientFactor*capColor(Color4f(ambi*envi.ambientRed/255.0f,ambi*envi.ambientGreen/255.0f,ambi*envi.ambientBlue/255.0f,1.0f)));
+		env.backgroundColor = capColor(Color4f(envi.skyRed/255.0f,envi.skyGreen/255.0f,envi.skyBlue/255.0f,1.0f));
+		// envi.minAlphaInt, envi.maxAlphaInt, envi.minAlphaFloat ?
+		// envi.maxAlphaFloat used for sky alpha
+		// sky_, skyt, skyb, sun_, undr used above
+		auto sunDirection=Vector3f(envi.sunDirectionX,envi.sunDirectionY,envi.sunDirectionZ);
+		//sunDirection.z=abs(sunDirection.z);
+		//sunDirection.z=max(0.7,sunDirection.z);
+		//sunDirection=sunDirection.normalized(); // TODO: why are sun directions in standard maps so extreme?
+		env.sunRotation=rotationBetween(Vector3f(0,0,1),sunDirection);
+		//env.sunColor=fixColor(Color4f(envi.sunColorRed/255.0f,envi.sunColorGreen/255.0f,envi.sunColorBlue/255.0f,1.0f));
+		//env.sunColor=Color4f(envi.ambientRed/255.0f,envi.ambientGreen/255.0f,envi.ambientBlue/255.0f,1.0f);
+		//env.sunColor=fixColor(Color4f(envi.sunColorRed/255.0f,envi.sunColorGreen/255.0f,envi.sunColorBlue/255.0f,1.0f));
+		//env.sunColor=Color4f(envi.sunColorRed/255.0f,envi.sunColorGreen/255.0f,envi.sunColorBlue/255.0f,1.0f);
+		/+env.sunColor=0.5f*Color4f(envi.ambientRed/255.0f,envi.ambientGreen/255.0f,envi.ambientBlue/255.0f,1.0f)+
+			0.5f*Color4f(envi.sunColorRed/255.0f,envi.sunColorGreen/255.0f,envi.sunColorBlue/255.0f,1.0f);+/
+		/+auto sunColor=envi.sunAmbientStrength/(envi.sunDirectStrength+envi.sunAmbientStrength)*Color4f(envi.ambientRed/255.0f,envi.ambientGreen/255.0f,envi.ambientBlue/255.0f,1.0f)+
+			envi.sunDirectStrength/(envi.sunDirectStrength+envi.sunAmbientStrength)*Color4f(envi.sunColorRed/255.0f,envi.sunColorGreen/255.0f,envi.sunColorBlue/255.0f,1.0f);+/
+		auto sunColor=envi.sunAmbientStrength/(envi.sunDirectStrength+envi.sunAmbientStrength)*capColor(Color4f(ambi*envi.ambientRed/255.0f,ambi*envi.ambientGreen/255.0f,ambi*envi.ambientBlue/255.0f,1.0f))+
+			envi.sunDirectStrength/(envi.sunDirectStrength+envi.sunAmbientStrength)*capColor(Color4f(envi.sunColorRed/255.0f,envi.sunColorGreen/255.0f,envi.sunColorBlue/255.0f,1.0f));
+		env.sunColor=capColor(Color4f(sunColor));
+		// TODO: figure this out
+		/+if(exp(envi.sunDirectStrength)==float.infinity)
+			env.sunColor=Color4f(envi.sunColorRed/255.0f,envi.sunColorGreen/255.0f,envi.sunColorBlue/255.0f,1.0f);
+		else
+			//env.sunColor=(exp(envi.sunDirectStrength)*Color4f(envi.sunColorRed/255.0f,envi.sunColorGreen/255.0f,envi.sunColorBlue/255.0f,1.0f)+exp(4*min(10,envi.sunAmbientStrength^^10))*Color4f(envi.ambientRed/255.0f,envi.ambientGreen/255.0f,envi.ambientBlue/255.0f,1.0f))/(exp(envi.sunDirectStrength)+exp(4*min(10,envi.sunAmbientStrength^^10)));
+			env.sunColor=(exp(envi.sunDirectStrength)*Color4f(envi.sunColorRed/255.0f,envi.sunColorGreen/255.0f,envi.sunColorBlue/255.0f,1.0f)+0.5f*exp(envi.sunAmbientStrength)*Color4f(envi.ambientRed/255.0f,envi.ambientGreen/255.0f,envi.ambientBlue/255.0f,1.0f))/(exp(envi.sunDirectStrength)+0.5f*exp(envi.sunAmbientStrength));+/
+		/+if(envi.sunAmbientStrength>=envi.sunDirectStrength){
+			env.sunColor=(exp(envi.sunDirectStrength)*Color4f(envi.sunColorRed/255.0f,envi.sunColorGreen/255.0f,envi.sunColorBlue/255.0f,1.0f)+exp(4*envi.sunAmbientStrength)*Color4f(envi.ambientRed/255.0f,envi.ambientGreen/255.0f,envi.ambientBlue/255.0f,1.0f))/(exp(envi.sunDirectStrength)+exp(4*envi.sunAmbientStrength));
+		}else{
+			env.sunColor=(exp(4*envi.sunDirectStrength)*Color4f(envi.sunColorRed/255.0f,envi.sunColorGreen/255.0f,envi.sunColorBlue/255.0f,1.0f)+exp(envi.sunAmbientStrength)*Color4f(envi.ambientRed/255.0f,envi.ambientGreen/255.0f,envi.ambientBlue/255.0f,1.0f))/(exp(4*envi.sunDirectStrength)+exp(envi.sunAmbientStrength));
+		}+/
+		// envi.sunFullbrightRed, envi.sunFullbrightGreen, envi.sunFullbrightBlue?
+		// landscapeSpecularity, specularityRed, specularityGreen, specularityBlue and
+		// landscapeGlossiness used for terrain material.
+		//env.atmosphericFog=true;
+		B.shadowMap.shadowColor=Color4f(envi.ambientRed/255.0f,envi.ambientGreen/255.0f,envi.ambientBlue/255.0f,1.0f);
+		B.shadowMap.shadowBrightness=max(0.0f,min(1.0f,1.0f-envi.shadowStrength));
+		env.fogColor=capColor(Color4f(envi.fogRed/255.0f,envi.fogGreen/255.0f,envi.fogBlue/255.0f,1.0f));
+		// fogType ?
+		if(options.enableFog){
+			env.fogStart=envi.fogNearZ;
+			env.fogEnd=envi.fogFarZ;
+		}
+		// fogDensity?
+	}
+
+	void renderSky(ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		auto totalTime=state.frame*1.0f/updateFPS;
+		B.sacSkyMaterialBackend.sunLoc = sacSky.sunSkyRelLoc(info.camera.position);
+		B.sacSkyMaterialBackend.cloudOffset=state.frame%(64*updateFPS)*1.0f/(64*updateFPS)*Vector2f(1.0f,-1.0f);
+		auto skyRotation=rotationQuaternion(Axis.z,2*pi!float/512.0f*totalTime);
+		auto map=state.map;
+		auto x=10.0f*map.n/2, y=10.0f*map.m/2;
+		auto skyPosition=Vector3f(x,y,sacSky.dZ*sacSky.scaling+1);
+		auto envi=&map.envi;
+		auto backend0=B.shadelessMaterialBackend;
+		backend0.bind(null,rc);
+		B.enableDepthMask();
+		backend0.setInformation(Vector4f(0.0f,0.0f,0.0f,0.0f));
+		backend0.setEnergy(sacSky.energy);
+		backend0.setTransformation(skyPosition,skyRotation,rc);
+		backend0.bindDiffuse(map.textures[skybIndex]);
+		sacSky.skyb.render(rc);
+		backend0.bindDiffuse(map.textures[skytIndex]);
+		sacSky.skyt.render(rc);
+		backend0.bindDiffuse(map.textures[undrIndex]);
+		sacSky.undr.render(rc);
+		auto backend1=B.sacSunMaterialBackend;
+		backend1.bind(null,rc);
+		backend1.setAlpha(1.0f);
+		backend1.setEnergy(25.0f*sacSky.energy);
+		backend1.bindDiffuse(map.textures[sunIndex]);
+		backend1.setTransformation(skyPosition,Quaternionf.identity(),rc); // TODO: don't create rotation matrix
+		sacSky.sun.render(rc);
+		auto backend2=B.sacSkyMaterialBackend;
+		backend2.bind(null,rc);
+		backend2.setAlpha(min(map.envi.maxAlphaFloat,1.0f));
+		backend2.setEnergy(sacSky.energy);
+		backend2.bindDiffuse(map.textures[skyIndex]);
+		backend2.setTransformation(skyPosition,Quaternionf.identity(),rc); // TODO: don't create rotation matrix
+		sacSky.sky.render(rc);
+	}
+
+	void renderMap(ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		auto map=state.map;
+		state.applyEdgeChanges();
+		map.updateEdgeMeshes(state.obj.opaqueObjects.edgeChanges);
+		rc.layer=1;
+		rc.modelMatrix=Matrix4x4f.identity();
+		rc.invModelMatrix=Matrix4x4f.identity();
+		rc.prevModelViewProjMatrix=Matrix4x4f.identity(); // TODO: get rid of this?
+		rc.modelViewMatrix=rc.viewMatrix*rc.modelMatrix;
+		rc.blurModelViewProjMatrix=rc.projectionMatrix*rc.modelViewMatrix; // TODO: get rid of this
+		B.Material mat;
+		if(!rc.shadowMode){
+			mat=map.material; // TODO: get rid of this completely?
+			mat.bind(rc);
+			B.terrainMaterialBackend.bindColor(map.color);
+		}else{
+			B.terrainShadowBackend.bind(null,rc);
+		}
+		foreach(i,mesh;map.meshes){
+			if(!mesh) continue;
+			if(!rc.shadowMode){
+				B.terrainMaterialBackend.bindDiffuse(map.textures[i]);
+				if(i<map.dti.length){
+					assert(!!map.details[map.dti[i]]);
+					B.terrainMaterialBackend.bindDetail(map.details[map.dti[i]]);
+				}else B.terrainMaterialBackend.bindDetail(null);
+				B.terrainMaterialBackend.bindEmission(map.textures[i]);
+			}
+			mesh.render(rc);
+		}
+		if(map.dynamicEdgeMesh){
+			if(!rc.shadowMode){
+				B.terrainMaterialBackend.bindDiffuse(map.textures[edgeIndex]);
+				B.terrainMaterialBackend.bindDetail(null);
+				B.terrainMaterialBackend.bindEmission(map.textures[edgeIndex]);
+			}
+			map.dynamicEdgeMesh.render(rc);
+		}
+		auto fallingLandChunks=&state.obj.opaqueObjects.effects.fallingLandChunks;
+		map.updateFallingLandChunkMeshes(*fallingLandChunks);
+		if(map.fallingLandChunkMeshes.length){
+			if(!rc.shadowMode) B.bindZeroTerrainDisplacement();
+			else B.bindZeroTerrainShadowDisplacement();
+			foreach(ref chunk;fallingLandChunks.data){
+				typeof(map.fallingLandChunkMeshes[0])* cached=null;
+				foreach(ref c;map.fallingLandChunkMeshes.data){
+					if(c.vertexI==chunk.vertexI&&c.vertexJ==chunk.vertexJ&&c.spawnFrame==chunk.spawnFrame){
+						cached=&c;
+						break;
+					}
+				}
+				if(!cached) continue;
+				static immutable int[2][4] quadrantTileOffsets=[[-1,-1],[0,-1],[-1,0],[0,0]];
+				if(!rc.shadowMode){
+					B.setTerrainTransformation(chunk.position,Quaternionf.identity(),rc);
+					foreach(q;0..4){
+						auto topMesh=cached.topMeshes[q];
+						if(!topMesh) continue;
+						auto texture=map.tiles[chunk.vertexJ+quadrantTileOffsets[q][1]][chunk.vertexI+quadrantTileOffsets[q][0]];
+						B.terrainMaterialBackend.bindDiffuse(map.textures[texture]);
+						if(texture<map.dti.length) B.terrainMaterialBackend.bindDetail(map.details[map.dti[texture]]);
+						else B.terrainMaterialBackend.bindDetail(null);
+						B.terrainMaterialBackend.bindEmission(map.textures[texture]);
+						topMesh.render(rc);
+					}
+					foreach(q;0..4){
+						auto bottomMesh=cached.bottomMeshes[q];
+						if(!bottomMesh) continue;
+						B.terrainMaterialBackend.bindDiffuse(map.textures[bottomIndex]);
+						B.terrainMaterialBackend.bindDetail(null);
+						B.terrainMaterialBackend.bindEmission(map.textures[bottomIndex]);
+						bottomMesh.render(rc);
+					}
+					if(cached.edgeMesh){
+						B.terrainMaterialBackend.bindDiffuse(map.textures[edgeIndex]);
+						B.terrainMaterialBackend.bindDetail(null);
+						B.terrainMaterialBackend.bindEmission(map.textures[edgeIndex]);
+						cached.edgeMesh.render(rc);
+					}
+				}else{
+					B.setTerrainShadowTransformation(chunk.position,Quaternionf.identity(),rc);
+					foreach(q;0..4) if(cached.topMeshes[q]) cached.topMeshes[q].render(rc);
+					foreach(q;0..4) if(cached.bottomMeshes[q]) cached.bottomMeshes[q].render(rc);
+					if(cached.edgeMesh) cached.edgeMesh.render(rc);
+				}
+			}
+			if(!rc.shadowMode){
+				B.resetTerrainTransformation(rc);
+				B.unbindZeroTerrainDisplacement();
+			}else{
+				B.resetTerrainShadowTransformation(rc);
+				B.unbindZeroTerrainShadowDisplacement();
+			}
+		}
+		//mat.unbind(rc); // TODO: needed?
+		/+auto pathFinder=state.pathFinder;
+		foreach(y;0..511){
+			foreach(x;0..511){
+				if(!pathFinder.unblocked(x,y,state)) continue;
+				auto p=pathFinder.position(x,y,state);
+				renderBox([p-Vector3f(1.0f,1.0f,1.0f),p+Vector3f(1.0f,1.0f,1.0f)],false,rc);
+			}
+		}+/
+	}
+
+	static void renderLoadedArrow(B)(ref MovingObject!B object,B.Mesh mesh,ObjectState!B state,RenderInfo!B* info,B.RenderContext rc){
+		auto loadedArrow=object.loadedArrow;
+		if(loadedArrow!=loadedArrow) return;
+		void renderArrow(Vector3f start,Vector3f end,float scale=1.0f){
+			auto direction=end-start;
+			auto len=direction.length;
+			auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),direction/len);
+			B.shadelessMaterialBackend.setTransformationScaled(start,rotation,Vector3f(scale,scale,len),rc);
+			mesh.render(rc);
+		}
+		with(loadedArrow){
+			renderArrow(hand,top,0.5f);
+			renderArrow(hand,bottom,0.5f);
+			renderArrow(hand,front);
+		}
+	}
+
+	struct R3DOpt{
+		bool enableWidgets;
+	}
+
+	void renderNTTs(RenderMode mode)(R3DOpt options,ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		static void render(T)(ref T objects,Renderer!B* self,bool enableWidgets,ObjectState!B state,RenderInfo!B* info,B.RenderContext rc,bool onlyOpaqueEffects=false){ // TODO: why does this need to be static? DMD bug?
+			static if(is(typeof(objects.sacObject))){
+				auto sacObject=objects.sacObject;
+				enum isMoving=is(T==MovingObjects!(B, renderMode), RenderMode renderMode);
+				enum isStatic=is(T==StaticObjects!(B, renderMode), RenderMode renderMode);
+				enum isFixed=is(T==FixedObjects!B);
+				static if(isFixed) if(!enableWidgets) return; // TODO: instanced rendering
+
+				static if(objects.renderMode==RenderMode.opaque){
+					enum prepareMaterials=RenderMode.opaque;
+				}else{
+					static if(isStatic){
+						enum prepareMaterials=mode;
+					}else{
+						enum prepareMaterials=RenderMode.transparent;
+					}
+				}
+				static if(prepareMaterials==RenderMode.opaque){
+					auto materials=rc.shadowMode?sacObject.shadowMaterials:sacObject.materials;
+				}else static if(prepareMaterials==RenderMode.transparent){
+					auto opaqueMaterials=rc.shadowMode?sacObject.shadowMaterials:sacObject.materials;
+					auto materials=rc.shadowMode?sacObject.shadowMaterials:sacObject.transparentMaterials;
+				}else static assert(0);
+				foreach(i;0..materials.length){
+					auto material=materials[i];
+					if(!material) continue;
+					auto blending=B.blending(material);
+					if((mode==RenderMode.transparent)!=(blending==B.Blending.Additive||blending==B.Blending.Transparent)) continue;
+					if(rc.shadowMode&&blending==B.Blending.Additive) continue;
+					static if(isStatic&&objects.renderMode==RenderMode.transparent){
+						auto originalBackend=material.backend;
+						static if(mode==RenderMode.opaque) material.backend=B.buildingSummonMaterialBackend1;
+						else material.backend=B.buildingSummonMaterialBackend2;
+						scope(success) material.backend=originalBackend;
+					}
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					static if(isMoving){
+						bool fasterStandupTimes=state.fasterStandupTimes;
+						auto mesh=sacObject.saxsi.meshes[i];
+						foreach(j;0..objects.length){ // TODO: use instanced rendering instead
+							if(rc.shadowMode&&objects.creatureStatss[j].effects.stealth) continue;
+							material.backend.setTransformationScaled(objects.positions[j], objects.rotations[j], objects.scales[j]*Vector3f(1.0f,1.0f,1.0f), rc);
+							auto id=objects.ids[j];
+							Vector4f information;
+							if(info.renderSide!=objects.sides[j]&&objects.creatureStates[j].mode.isGhost) continue;
+							if(state.fogOfWar3d&&info.renderSide!=objects.sides[j]&&!state.positionVisibleToSide(info.renderSide,objects.positions[j])) continue;
+							if(info.renderSide!=objects.sides[j]
+							   &&(!objects.creatureStates[j].mode.isVisibleToOtherSides||objects.creatureStatss[j].effects.stealth)
+							   &&objects.creatureStates[j].mode!=CreatureMode.dead // TODO: dead creatures should not hide their own souls
+							){
+								information=Vector4f(0.0f,0.0f,0.0f,0.0f);
+							}else information=Vector4f(2.0f,id>>16,id&((1<<16)-1),1.0f);
+							material.backend.setInformation(information);
+							float bulk=objects.creatureStatss[j].effects.bulk;
+							if(bulk!=1.0f){
+								if(material.backend is B.boneMaterialBackend) B.boneMaterialBackend.setBulk(bulk);
+								if(material.backend is B.shadelessBoneMaterialBackend) B.shadelessBoneMaterialBackend.setBulk(bulk);
+								if(material.backend is B.boneShadowBackend) B.boneShadowBackend.setBulk(bulk);
+							}
+							scope(success) if(bulk!=1.0f){
+								if(material.backend is B.boneMaterialBackend) B.boneMaterialBackend.setBulk(1.0f);
+								if(material.backend is B.shadelessBoneMaterialBackend) B.shadelessBoneMaterialBackend.setBulk(1.0f);
+								if(material.backend is B.boneShadowBackend) B.boneShadowBackend.setBulk(1.0f);
+							}
+							static if(prepareMaterials==RenderMode.transparent){
+								if(!rc.shadowMode){
+									B.shadelessBoneMaterialBackend.setAlpha(objects.alphas[j]);
+									B.shadelessBoneMaterialBackend.setEnergy(objects.energies[j]);
+								}
+							}else{
+								bool petrified=!rc.shadowMode && material.backend is B.boneMaterialBackend && objects.creatureStatss[j].effects.stoneEffect;
+								if(petrified) B.boneMaterialBackend.setPetrified(true);
+								scope(success) if(petrified) B.boneMaterialBackend.setPetrified(false);
+								bool slimed=!rc.shadowMode && material.backend is B.boneMaterialBackend && objects.creatureStatss[j].effects.slimed;
+								auto idiffuse = typeof("diffuse" in material.inputs).init;
+								if(slimed){
+									idiffuse="diffuse" in material.inputs;
+									auto sdiffuse="diffuse" in self.slime.material.inputs;
+									if(auto stx=sdiffuse.texture) B.boneMaterialBackend.bindDiffuse(stx); // TODO: render slimed creatures in a separate pass/using shader setting instead?
+									else idiffuse=null;
+								}
+								scope(success){
+									if(slimed && idiffuse.texture) B.boneMaterialBackend.bindDiffuse(idiffuse.texture);
+								}
+							}
+							// TODO: interpolate animations to get 60 FPS?
+							auto pose=sacObject.getRenderFrame(objects.animationStates[j],objects.frames[j]/updateAnimFactor,fasterStandupTimes);
+							if(material.backend is B.boneMaterialBackend) B.boneMaterialBackend.setPose(pose.matrices);
+							if(material.backend is B.shadelessBoneMaterialBackend) B.shadelessBoneMaterialBackend.setPose(pose.matrices);
+							if(material.backend is B.boneShadowBackend) B.boneShadowBackend.setPose(pose.matrices);
+							mesh.render(rc);
+							if(objects.creatureStatss[j].effects.vined){ // TODO: this is a bit hacky
+								foreach(ref vines;state.obj.opaqueObjects.effects.graspingViness.data){
+									if(vines.creature!=objects.ids[j]) continue;
+									if(isNaN(vines.preTeleportPosition.x)) break;
+									auto preTeleportPosition=vines.preTeleportPosition;
+									auto position=objects.positions[j];
+									auto z=state.getHeight(preTeleportPosition)+position.z-state.getHeight(position);
+									position=preTeleportPosition+Vector3f(0.0f,0.0f,z);
+									material.backend.setTransformationScaled(position, objects.rotations[j], objects.scales[j]*Vector3f(1.0f,1.0f,1.0f), rc);
+									mesh.render(rc);
+									break;
+								}
+							}
+						}
+					}else{
+						material.backend.setInformation(Vector4f(0.0f,0.0f,0.0f,0.0f));
+						int frame=0; // TODO: select frame
+						auto mesh=sacObject.meshes[frame][i];
+						static if(isStatic&&objects.renderMode==RenderMode.transparent&&mode==RenderMode.transparent){
+							auto opaqueMaterial=opaqueMaterials[i];
+							auto opaqueBlending=B.blending(opaqueMaterial);
+							bool enableDiscard=opaqueBlending!=B.Blending.Transparent;
+							if(!enableDiscard) B.buildingSummonMaterialBackend2.setEnableDiscard(false);
+							scope(success) if(!enableDiscard) B.buildingSummonMaterialBackend2.setEnableDiscard(true);
+						}
+						foreach(j;0..objects.length){
+							static if(isStatic&&objects.renderMode==RenderMode.transparent){
+								auto thresholdZ=objects.thresholdZs[j];
+								static if(mode==RenderMode.opaque){
+									B.buildingSummonMaterialBackend1.setThresholdZ(thresholdZ);
+								}else static if(mode==RenderMode.transparent){
+									B.buildingSummonMaterialBackend2.setThresholdZ(thresholdZ,thresholdZ+structureCastingGradientSize);
+								}else static assert(0);
+							}
+							auto position=objects.positions[j];
+							static if(isFixed) position.z=state.getGroundHeight(position);
+							static if(isStatic){
+								if(state.fogOfWar3d){
+									auto fogSide=state.buildingById!((ref b)=>b.side,()=>-1)(objects.buildingIds[j]);
+									if(fogSide!=info.renderSide&&!state.positionExploredBySide(info.renderSide,position)) continue;
+								}
+							}
+							static if(isStatic||isMoving){
+								material.backend.setTransformationScaled(position, objects.rotations[j], objects.scales[j]*Vector3f(1.0f,1.0f,1.0f), rc);
+							}else material.backend.setTransformation(position, objects.rotations[j], rc);
+							static if(isStatic){
+								auto id=objects.ids[j];
+								material.backend.setInformation(Vector4f(2.0f,id>>16,id&((1<<16)-1),1.0f));
+							}
+							mesh.render(rc);
+						}
+					}
+				}
+			}else static if(is(T==Souls!B)){
+				static if(mode==RenderMode.transparent){
+					if(rc.shadowMode) return;
+					void renderSouls(bool filterGreen,T)(T sacSoul){
+						auto material=sacSoul.material;
+						foreach(j;0..objects.length){
+							auto soul=objects[j];
+							if(state.fogOfWar3d&&!state.positionExploredBySide(info.renderSide,soul.position)) continue;
+							auto color=soul.color(info.renderSide,state);
+							static if(filterGreen){
+								bool isGreen=color==SoulColor.green;
+								static if(is(T==SacSoul!B)){
+									if(isGreen) continue;
+								}else static if(is(T==SacGreenSoul!B)){
+									if(!isGreen) continue;
+								}
+							}
+							auto mesh=sacSoul.getMesh(color,soul.frame/updateAnimFactor); // TODO: do in shader?
+							auto id=soul.id;
+							material.backend.setInformation(Vector4f(3.0f,id>>16,id&((1<<16)-1),1.0f));
+							if(objects[j].number==1){
+								material.backend.setSpriteTransformationScaled(soul.position+soul.scaling*Vector3f(0.0f,0.0f,1.25f*sacSoul.soulHeight),soul.scaling,rc);
+								mesh.render(rc);
+							}else{
+								auto number=objects[j].number;
+								auto soulScaling=max(0.5f,1.0f-0.05f*number);
+								auto radius=soul.scaling*sacSoul.soulRadius;
+								if(number<=3) radius*=0.3*number;
+								foreach(k;0..number){
+									auto position=soul.position+rotate(facingQuaternion(objects[j].facing+2*pi!float*k/number), Vector3f(0.0f,radius,0.0f));
+									material.backend.setSpriteTransformationScaled(position+soul.scaling*Vector3f(0.0f,0.0f,1.25f*sacSoul.soulHeight),soul.scaling*soulScaling,rc);
+									mesh.render(rc);
+								}
+							}
+						}
+					}
+					if(state.greenAllySouls&&self.sacGreenSoul){
+						self.sacSoul.material.bind(rc);
+						renderSouls!true(self.sacSoul);
+						self.sacSoul.material.unbind(rc);
+						self.sacGreenSoul.material.bind(rc);
+						renderSouls!true(self.sacGreenSoul);
+						self.sacGreenSoul.material.unbind(rc);
+					}else{
+						auto sacSoul=self.sacSoul;
+						auto material=sacSoul.material;
+						material.bind(rc);
+						renderSouls!false(sacSoul);
+						material.unbind(rc);
+					}
+				}
+			}else static if(is(T==Buildings!B)){
+				// do nothing
+			}else static if(is(T==Effects!B)){
+				if(!onlyOpaqueEffects){
+				static if(mode==RenderMode.opaque) if(objects.debris.length||objects.fireballCastings.length||objects.fireballs.length||objects.volcanoLavaBalls.length){
+					auto materials=self.sacDebris.materials;
+					foreach(i;0..materials.length){
+						auto material=materials[i];
+						material.bind(rc);
+						scope(success) material.unbind(rc);
+						auto mesh=self.sacDebris.meshes[0][i];
+						foreach(j;0..objects.debris.length){
+							material.backend.setTransformationScaled(objects.debris[j].position,objects.debris[j].rotation,0.2f*Vector3f(1.0f,1.0f,1.0f),rc);
+							mesh.render(rc);
+						}
+						foreach(j;0..objects.fireballCastings.length){
+							if(objects.fireballCastings[j].fireball.hydro) continue; // Hydro mod: Water Jet is drawn with its drops
+							auto scale=0.25f*min(1.0f,objects.fireballCastings[j].frame/(objects.fireballCastings[j].fireball.spell.castingTime(9)*updateFPS));
+							material.backend.setTransformationScaled(objects.fireballCastings[j].fireball.position,objects.fireballCastings[j].fireball.rotation,scale*Vector3f(1.0f,1.0f,1.0f),rc);
+							mesh.render(rc);
+						}
+						foreach(j;0..objects.fireballs.length){
+							if(objects.fireballs[j].hydro) continue;
+							material.backend.setTransformationScaled(objects.fireballs[j].position,objects.fireballs[j].rotation,0.25f*Vector3f(1.0f,1.0f,1.0f),rc);
+							mesh.render(rc);
+						}
+						foreach(j;0..objects.volcanoLavaBalls.length){
+							material.backend.setTransformationScaled(objects.volcanoLavaBalls[j].position,objects.volcanoLavaBalls[j].rotation,objects.volcanoLavaBalls[j].scale*Vector3f(1.0f,1.0f,1.0f),rc);
+							mesh.render(rc);
+						}
+					}
+				}
+				static if(mode==RenderMode.transparent)
+				if(!rc.shadowMode&&
+				   (objects.explosions.length||
+				    objects.styxExplosions.length)
+				){
+					auto material=self.explosion.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					foreach(j;0..objects.explosions.length){
+						auto mesh=self.explosion.getFrame(objects.explosions[j].frame);
+						material.backend.setTransformationScaled(objects.explosions[j].position,Quaternionf.identity(),objects.explosions[j].scale*Vector3f(1.1f,1.1f,0.9f),rc);
+						mesh.render(rc);
+					}
+					if(objects.styxExplosions.length){
+						assert(material.backend is B.shadelessMaterialBackend);
+						B.shadelessMaterialBackend.setEnergy(-1.0f);
+					}
+					foreach(j;0..objects.styxExplosions.length){
+						auto mesh=self.explosion.getFrame(objects.styxExplosions[j].frame);
+						material.backend.setTransformationScaled(objects.styxExplosions[j].position,Quaternionf.identity(),objects.styxExplosions[j].scale*Vector3f(1.1f,1.1f,0.9f),rc);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.sacDocCastings.length||objects.rituals.length)){
+					auto centerMat=self.vortex.redCenterMat;
+					void renderRedCenter(ref RedVortex vortex){
+						centerMat.backend.setSpriteTransformationScaled(vortex.position,vortex.scale*vortex.radius,rc);
+						auto mesh=self.vortex.getCenterFrame(vortex.frame%self.vortex.numRimFrames);
+						mesh.render(rc);
+					}
+					auto rimMat=self.vortex.redRimMat;
+					void renderRedRim(ref RedVortex vortex){
+						rimMat.backend.setSpriteTransformationScaled(vortex.position,vortex.scale*vortex.radius,rc);
+						auto mesh=self.vortex.getRimFrame(vortex.frame%self.vortex.numRimFrames);
+						mesh.render(rc);
+					}
+					centerMat.bind(rc);
+					foreach(j;0..objects.sacDocCastings.length) renderRedCenter(objects.sacDocCastings[j].vortex);
+					foreach(j;0..objects.rituals.length) if(!isNaN(objects.rituals[j].vortex.position.x)) renderRedCenter(objects.rituals[j].vortex);
+					centerMat.unbind(rc);
+					rimMat.bind(rc);
+					foreach(j;0..objects.sacDocCastings.length) renderRedRim(objects.sacDocCastings[j].vortex);
+					foreach(j;0..objects.rituals.length) if(!isNaN(objects.rituals[j].vortex.position.x)) renderRedRim(objects.rituals[j].vortex);
+					rimMat.unbind(rc);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.sacDocCarries.length){
+					auto getPositionAndScaleForId(int id,float scale){
+						alias H=Vector3f[2];
+						auto hitbox=state.movingObjectReadById!((ref objects,i)=>objects.hitbox(i),()=>H.init)(id);
+						auto size=boxSize(hitbox);
+						return tuple(boxCenter(hitbox),scale*0.65f*Vector3f(1.1f*size.length,0.9f*size.length,0.0f)); // TODO
+					}
+					auto centerMat=self.vortex.blueCenterMat;
+					void renderBlueCenter(Vector3f position,Vector3f scale,int frame){
+						if(isNaN(position.x)) return;
+						centerMat.backend.setSpriteTransformationScaled(position,scale,rc);
+						auto mesh=self.vortex.getCenterFrame(frame%self.vortex.numRimFrames);
+						mesh.render(rc);
+					}
+					void renderBlueCenterForId(int id,float scale,int frame){
+						if(!id) return;
+						return renderBlueCenter(getPositionAndScaleForId(id,scale).expand,frame);
+					}
+					auto rimMat=self.vortex.blueRimMat;
+					void renderBlueRim(Vector3f position,Vector3f scale,int frame){
+						if(isNaN(position.x)) return;
+						rimMat.backend.setSpriteTransformationScaled(position,scale,rc);
+						auto mesh=self.vortex.getRimFrame(frame%self.vortex.numRimFrames);
+						mesh.render(rc);
+					}
+					void renderBlueRimForId(int id,float scale,int frame){
+						if(!id) return;
+						return renderBlueRim(getPositionAndScaleForId(id,scale).expand,frame);
+					}
+					centerMat.bind(rc);
+					foreach(j;0..objects.sacDocCarries.length)
+						if(objects.sacDocCarries[j].status.among(SacDocCarryStatus.move,SacDocCarryStatus.shrinking))
+							renderBlueCenterForId(objects.sacDocCarries[j].creature,objects.sacDocCarries[j].vortexScale,objects.sacDocCarries[j].frame);
+					centerMat.unbind(rc);
+					rimMat.bind(rc);
+					foreach(j;0..objects.sacDocCarries.length)
+						if(objects.sacDocCarries[j].status.among(SacDocCarryStatus.move,SacDocCarryStatus.shrinking))
+							renderBlueRimForId(objects.sacDocCarries[j].creature,objects.sacDocCarries[j].vortexScale,objects.sacDocCarries[j].frame);
+					rimMat.unbind(rc);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.sacDocCarries.length||objects.rituals.length)){
+					auto material=self.tether.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					B.shadelessBoneMaterialBackend.setTransformation(Vector3f(0.0f,0.0f,0.0f),Quaternionf.identity(),rc);
+					void renderTether(ref SacDocTether tether,int frame){
+						if(isNaN(tether.locations[0].x)) return;
+						auto alpha=pi!float*frame/updateFPS;
+						auto energy=0.375f+14.625f*(0.5f+0.25f*cos(7.0f*alpha)+0.25f*sin(11.0f*alpha));
+						B.shadelessBoneMaterialBackend.setEnergy(energy);
+						auto mesh=self.tether.getFrame(frame%self.tether.numFrames);
+						Matrix4x4f[self.tether.numSegments+1] pose;
+						foreach(i,ref x;pose){
+							auto curve = tether.get(i/float(pose.length-1));
+							auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),curve[1].normalized);
+							x=Transformation(rotation,curve[0]).getMatrix4f;
+						}
+						B.shadelessBoneMaterialBackend.setPose(pose);
+						mesh.render(rc);
+					}
+					foreach(j;0..objects.sacDocCarries.length) renderTether(objects.sacDocCarries[j].tether,objects.sacDocCarries[j].frame);
+					foreach(j;0..objects.rituals.length) foreach(k;0..4) renderTether(objects.rituals[j].tethers[k],objects.rituals[j].frame);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.guardians.length){
+					auto material=self.guardianTether.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					void renderGuardianTether(ref Guardian guardian){
+						with(guardian){
+							auto diff=end-start;
+							auto len=diff.length;
+							auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),diff/len);
+							auto pulse=0.75f+0.25f*0.5f*(1.0f+sin(2.0f*pi!float*(frame%pulseFrames)/(pulseFrames-1)));
+							B.shadelessBoneMaterialBackend.setTransformationScaled(start,rotation,Vector3f(pulse,pulse,(1.0f/1.5f)*len),rc);
+							auto mesh=self.guardianTether.getFrame(frame%self.guardianTether.numFrames);
+							Matrix4x4f[self.guardianTether.numSegments+1] pose;
+							pose[0]=pose[self.guardianTether.numSegments]=Matrix4f.identity();
+							foreach(i,ref x;pose[1..$-1]){
+								auto curve=get(i/float(pose.length-1));
+								x=Transformation(Quaternionf.identity(),curve[0]).getMatrix4f;
+							}
+							B.shadelessBoneMaterialBackend.setPose(pose);
+							mesh.render(rc);
+						}
+					}
+					foreach(ref guardian;objects.guardians.data) renderGuardianTether(guardian);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.blueRings.length||objects.teleportRings.length)){
+					auto material=self.blueRing.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					foreach(j;0..objects.blueRings.length){
+						auto position=objects.blueRings[j].position;
+						auto scale=objects.blueRings[j].scale;
+						B.shadelessMaterialBackend.setTransformationScaled(position,Quaternionf.identity(),scale*Vector3f(1.0f,1.0f,1.0f),rc);
+						B.shadelessMaterialBackend.setEnergy(20.0f*scale^^4);
+						auto mesh=self.blueRing.getFrame(objects.blueRings[j].frame%self.blueRing.numFrames);
+						mesh.render(rc);
+					}
+					foreach(j;0..objects.teleportRings.length){
+						auto position=objects.teleportRings[j].position;
+						auto scale=objects.teleportRings[j].scale*sqrt(1.0f-float(objects.teleportRings[j].frame)/teleportRingLifetime);
+						B.shadelessMaterialBackend.setTransformationScaled(position,Quaternionf.identity(),0.08f*scale*Vector3f(1.0f,1.0f,1.0f),rc);
+						B.shadelessMaterialBackend.setEnergy(20.0f*scale^^2);
+						auto mesh=self.blueRing.getFrame(objects.teleportRings[j].frame%self.blueRing.numFrames);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.levelUpRings.length){
+					auto material=self.levelUpRing.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					foreach(j;0..objects.levelUpRings.length){
+						auto position=objects.levelUpRings[j].position;
+						auto scale=objects.levelUpRings[j].scale*sqrt(1.0f-float(max(0,objects.levelUpRings[j].frame))/levelUpRingLifetime);
+						B.shadelessMaterialBackend.setTransformationScaled(position,Quaternionf.identity(),0.08f*scale*Vector3f(1.0f,1.0f,1.0f),rc);
+						B.shadelessMaterialBackend.setEnergy(20.0f*scale);
+						auto mesh=self.levelUpRing.getFrame(objects.levelUpRings[j].spriteFrame%self.levelUpRing.numFrames);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.levelDownRings.length){
+					auto material=self.levelDownRing.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					foreach(j;0..objects.levelDownRings.length){
+						auto position=objects.levelDownRings[j].position;
+						auto scale=objects.levelDownRings[j].scale*sqrt(1.0f-float(objects.levelDownRings[j].frame)/levelDownRingLifetime);
+						B.shadelessMaterialBackend.setTransformationScaled(position,Quaternionf.identity(),0.08f*scale*Vector3f(1.0f,1.0f,1.0f),rc);
+						B.shadelessMaterialBackend.setEnergy(20.0f*scale^^2);
+						auto mesh=self.levelDownRing.getFrame(objects.levelDownRings[j].spriteFrame%self.levelUpRing.numFrames);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode){
+					auto fasterStandupTimes=state.fasterStandupTimes;
+					foreach(j;0..objects.speedUpShadows.length){
+						if((objects.speedUpShadows[j].age+1)%speedUpShadowSpacing!=0) continue;
+						auto id=objects.speedUpShadows[j].creature;
+						if(!state.isValidTarget(id,TargetType.creature)) continue;
+						auto sacObjectPetrifiedSlimedBulk=state.movingObjectReadById!((ref objects,i)=>tuple(objects.sacObject,objects.creatureStatss[i].effects.stoneEffect,objects.creatureStatss[i].effects.slimed,objects.creatureStatss[i].effects.bulk),()=>tuple(SacObject!B.init,false,false,1.0f))(id); // TODO: store within SpeedUpShadow?
+						auto sacObject=sacObjectPetrifiedSlimedBulk[0], petrified=sacObjectPetrifiedSlimedBulk[1], slimed=sacObjectPetrifiedSlimedBulk[2], bulk=sacObjectPetrifiedSlimedBulk[3];
+						if(!sacObject) continue;
+						auto materials=sacObject.transparentMaterials;
+						foreach(i;0..materials.length){
+							auto mesh=sacObject.saxsi.meshes[i];
+							auto material=materials[i];
+							material.bind(rc);
+							scope(success) material.unbind(rc);
+							material.backend.setTransformationScaled(objects.speedUpShadows[j].position,objects.speedUpShadows[j].rotation,objects.speedUpShadows[j].scale*Vector3f(1.0f,1.0f,1.0f),rc);
+							B.shadelessBoneMaterialBackend.setAlpha(0.3f);
+							B.shadelessBoneMaterialBackend.setEnergy(10.0f);
+							if(bulk!=1.0f) B.shadelessBoneMaterialBackend.setBulk(bulk);
+							scope(success) if(bulk!=1.0f) B.shadelessBoneMaterialBackend.setBulk(1.0f);
+							if(petrified) B.shadelessBoneMaterialBackend.setPetrified(true);
+							scope(success) if(petrified) B.shadelessBoneMaterialBackend.setPetrified(false);
+							auto idiffuse = typeof("diffuse" in material.inputs).init;
+							if(slimed){
+									idiffuse="diffuse" in material.inputs;
+									auto sdiffuse="diffuse" in self.slime.material.inputs;
+									if(auto stx=sdiffuse.texture) B.boneMaterialBackend.bindDiffuse(stx); // TODO: render slimed creatures in a separate pass/using shader setting instead?
+									else idiffuse=null;
+							}
+							scope(success){
+								if(slimed && idiffuse.texture) B.boneMaterialBackend.bindDiffuse(idiffuse.texture);
+							}
+							auto pose=sacObject.getRenderFrame(objects.speedUpShadows[j].animationState,objects.speedUpShadows[j].frame/updateAnimFactor,fasterStandupTimes);
+							B.shadelessBoneMaterialBackend.setPose(pose.matrices);
+							mesh.render(rc);
+						}
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&& // TODO: cloud shadows?
+				                                           (objects.cloudkillCastings.length||
+				                                            objects.cloudkills.length)
+				){
+					B.disableDepthMask();
+					B.enableCulling();
+					scope(success){
+						B.enableCulling();
+						B.enableDepthMask();
+					}
+					auto material=self.cloud2.blueMaterial;
+					B.shadelessMorphMaterialBackend.bind(material,rc);
+					B.enableTransparency();
+					scope(success) B.shadelessMorphMaterialBackend.unbind(material,rc);
+					void renderCloud2(Vector3f position,float radius,float scale,int frame){
+						B.shadelessMorphMaterialBackend.setAlpha(0.15f*scale);
+						foreach(v;0..20){
+							auto mesh1Mesh2Progress=self.cloud2.getFrame(frame+4*updateFPS*v,frame);
+							auto mesh1=mesh1Mesh2Progress[0], mesh2=mesh1Mesh2Progress[1], progress=mesh1Mesh2Progress[2];
+							B.shadelessMorphMaterialBackend.setTransformationScaled(position,Quaternionf.identity(),radius*(0.5f+0.5f*scale)*(1.0f-0.3f/20*v)*Vector3f(1.3f,1.3f,0.5f),rc);
+							B.shadelessMorphMaterialBackend.setMorphProgress(progress);
+							mesh1.morph(mesh2,rc);
+						}
+					}
+					foreach(ref cloudkillCasting;objects.cloudkillCastings.data)
+						with(cloudkillCasting.cloudkill) renderCloud2(position,Cloudkill!B.cloudRadius,cloudScale,cloudFrame);
+					foreach(ref cloudkill;objects.cloudkills.data)
+						with(cloudkill) renderCloud2(position,Cloudkill!B.cloudRadius,cloudScale,cloudFrame);
+				}
+				static if(mode==RenderMode.transparent)
+					if(!rc.shadowMode&&
+					   (objects.lightnings.length||
+					    objects.chainLightningCastingEffects.length||
+					    objects.soulWindEffects.length||
+					    objects.cagePulls.length||
+					    objects.rituals.length||
+					    objects.styxBolts.length||
+					    objects.deathEffects.length)
+				){
+					auto material=self.lightning.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					void renderBolts(int totalFrames,float scale=1.0f,bool negativeEnergy=false)(LightningBolt[] bolts,Vector3f start,Vector3f end,int frame,float α,float β){
+						auto diff=end-start;
+						auto len=diff.length;
+						auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),diff/len);
+						B.shadelessBoneMaterialBackend.setTransformationScaled(start,rotation,Vector3f(scale,scale,scale*0.1f*len),rc);
+						auto alpha=pi!float*frame/float(totalFrames);
+						auto energy=0.375f+14.625f*(0.5f+0.25f*cos(7.0f*alpha)+0.25f*sin(11.0f*alpha));
+						static if(negativeEnergy) energy*=-2.0f/15.0f;
+						B.shadelessBoneMaterialBackend.setEnergy(energy);
+						auto mesh=self.lightning.getFrame(frame%self.lightning.numFrames);
+						foreach(ref bolt;bolts){
+							Matrix4x4f[numLightningSegments+1] pose;
+							foreach(k,ref x;pose) x=Transformation(Quaternionf.identity(),(1.0f/scale)*bolt.get(max(α,min(float(k)/numLightningSegments,β)))).getMatrix4f;
+							B.shadelessBoneMaterialBackend.setPose(pose);
+							mesh.render(rc);
+						}
+					}
+					foreach(j;0..objects.lightnings.length){
+						auto start=objects.lightnings[j].start.center(state);
+						auto end=objects.lightnings[j].end.center(state);
+						auto frame=objects.lightnings[j].frame;
+						enum totalFrames=Lightning!B.totalFrames;
+						enum travelDelay=Lightning!B.travelDelay;
+						auto α=0.0f,β=1.0f;
+						if(frame<travelDelay){
+							β=frame/float(travelDelay);
+						}else if(frame>totalFrames-travelDelay){
+							α=(frame-(totalFrames-travelDelay))/float(travelDelay);
+						}
+						auto bolts=objects.lightnings[j].bolts[];
+						renderBolts!totalFrames(bolts,start,end,frame,α,β);
+					}
+					foreach(j;0..objects.chainLightningCastingEffects.length){
+						auto start=objects.chainLightningCastingEffects[j].start;
+						auto end=objects.chainLightningCastingEffects[j].end;
+						auto frame=objects.chainLightningCastingEffects[j].frame;
+						enum totalFrames=ChainLightningCastingEffect!B.totalFrames;
+						enum travelDelay=ChainLightningCastingEffect!B.travelDelay;
+						auto α=0.0f,β=1.0f;
+						if(frame<travelDelay){
+							β=frame/float(travelDelay);
+						}else if(frame>totalFrames-travelDelay){
+							α=(frame-(totalFrames-travelDelay))/float(travelDelay);
+						}
+						auto bolts=(&objects.chainLightningCastingEffects[j].bolt)[0..1];
+						renderBolts!(totalFrames,0.5f)(bolts,start,end,frame,α,β);
+					}
+					foreach(j;0..objects.soulWindEffects.length){
+						auto start=objects.soulWindEffects[j].start.center(state);
+						auto end=objects.soulWindEffects[j].end.center(state);
+						auto frame=objects.soulWindEffects[j].frame;
+						enum totalFrames=SoulWindEffect.totalFrames;
+						auto bolts=objects.soulWindEffects[j].bolts[];
+						renderBolts!totalFrames(bolts,start,end,frame,0.0f,1.0f);
+					}
+					foreach(j;0..objects.cagePulls.length){
+						auto creature=objects.cagePulls[j].creature;
+						auto start=state.movingObjectReadById!(.shotPosition,()=>Vector3f.init)(creature);
+						if(isNaN(start.x)) continue;
+						auto target=objects.cagePulls[j].target;
+						if(!target) continue;
+						auto end=state.movingObjectReadById!(.center,()=>Vector3f.init)(target);
+						if(isNaN(end.x)) continue;
+						auto frame=objects.cagePulls[j].frame;
+						enum totalFrames=typeof(objects.cagePulls[j]).totalFrames;
+						enum travelDelay=typeof(objects.cagePulls[j]).numShootFrames;
+						auto α=0.0f,β=1.0f;
+						if(frame<travelDelay) β=frame/float(travelDelay);
+						auto bolts=(&objects.cagePulls[j].bolt)[0..1];
+						renderBolts!(totalFrames,0.75f)(bolts,start,end,frame,α,β);
+					}
+					foreach(j;0..objects.rituals.length){
+						auto frame=objects.rituals[j].frame;
+						if(!isNaN(objects.rituals[j].altarBolts[0].displacement[0].x)){
+							auto start=state.staticObjectReadById!((ref objects,i)=>objects.positions[i]+Vector3f(0.0f,0.0f,60.0f),()=>Vector3f.init)(objects.rituals[j].shrine);
+							auto end=state.movingObjectReadById!(.center,()=>Vector3f.init)(objects.rituals[j].creature);
+							if(!isNaN(end.x)&&!isNaN(start.x)) renderBolts!(Lightning!B.totalFrames)(objects.rituals[j].altarBolts[],start,end,frame,0.0f,1.0f);
+						}
+						if(objects.rituals[j].targetWizard){
+							auto start=objects.rituals[j].vortex.position;
+							auto end=state.movingObjectReadById!(.center,()=>Vector3f.init)(objects.rituals[j].targetWizard);
+							if(!isNaN(end.x)&&!isNaN(start.x)) renderBolts!(Lightning!B.totalFrames)(objects.rituals[j].desecrateBolts[],start,end,frame,0.0f,1.0f);
+						}
+					}
+					foreach(j;0..objects.styxBolts.length){
+						auto start=objects.styxBolts[j].position;
+						auto end=objects.styxBolts[j].targetPosition;
+						auto frame=objects.styxBolts[j].frame;
+						enum totalFrames=StyxBolt!B.totalFrames;
+						auto bolts=(&objects.styxBolts[j].bolt)[0..1];
+						renderBolts!(totalFrames,1.5f,true)(bolts,start,end,frame,0.0f,1.0f);
+					}
+					foreach(ref deathEffect;objects.deathEffects.data){
+						auto start=deathEffect.start;
+						auto end=deathEffect.end;
+						auto frame=deathEffect.frame;
+						enum totalFrames=DeathEffect.totalFrames;
+						enum travelDelay=DeathEffect.travelDelay;
+						auto α=0.0f,β=1.0f;
+						if(frame<travelDelay){
+							β=frame/float(travelDelay);
+						}else if(frame>totalFrames-travelDelay){
+							α=(frame-(totalFrames-travelDelay))/float(travelDelay);
+						}
+						auto bolts=(&deathEffect.bolt)[0..1];
+						renderBolts!(totalFrames,0.75f,true)(bolts,start,end,frame,α,β);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.wraths.length||objects.altarDestructions.length)){
+					auto material=self.wrath.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					void renderWrath(int frame,Vector3f position,float scale_=1.0f){
+						auto mesh=self.wrath.getFrame(frame);
+						auto scale=scale_*self.wrath.maxScale/self.wrath.numFrames*frame;
+						B.shadelessMaterialBackend.setTransformationScaled(position,Quaternionf.identity(),Vector3f(scale,scale,1.0f),rc);
+						mesh.render(rc);
+					}
+					foreach(j;0..objects.wraths.length){
+						if(objects.wraths[j].status!=WrathStatus.exploding) continue;
+						auto frame=objects.wraths[j].frame;
+						auto position=objects.wraths[j].position+Vector3f(0.0f,0.0f,self.wrath.maxOffset/self.wrath.numFrames*objects.wraths[j].frame);
+						renderWrath(frame,position);
+					}
+					foreach(j;0..objects.altarDestructions.length){
+						enum delay=AltarDestruction.disappearDuration+AltarDestruction.floatDuration;
+						if(objects.altarDestructions[j].frame<delay) continue;
+						auto frame=(objects.altarDestructions[j].frame-delay)*(self.wrath.numFrames-1)/AltarDestruction.explodeDuration;
+						auto position=objects.altarDestructions[j].position;
+						renderWrath(frame,position,20.0f);
+					}
+				}
+				static if(mode==RenderMode.opaque) if(objects.rockCastings.length||objects.rocks.length||
+				                                      objects.soulMoleCastings.length||objects.soulMoles.length||
+				                                      objects.boreCastings.length||objects.bores.length||
+				                                      objects.haloOfEarthCastings.length||objects.haloOfEarths.length||
+				                                      objects.eruptDebris.length||
+				                                      objects.earthflingProjectiles.length||objects.flummoxProjectiles.length||objects.boulderdashProjectiles.length||
+				                                      objects.bombardmentDrops.length||
+				                                      objects.rockForms.length
+				){
+					auto materials=self.rock.materials;
+					foreach(i;0..materials.length){
+						auto material=materials[i];
+						material.bind(rc);
+						scope(success) material.unbind(rc);
+						auto mesh=self.rock.meshes[0][i];
+						foreach(j;0..objects.rockCastings.length){
+							auto scale=1.0f*Vector3f(1.0f,1.0f,1.0f);
+							material.backend.setTransformationScaled(objects.rockCastings[j].rock.position,objects.rockCastings[j].rock.rotation,scale,rc);
+							mesh.render(rc);
+						}
+						foreach(j;0..objects.rocks.length){
+							material.backend.setTransformationScaled(objects.rocks[j].position,objects.rocks[j].rotation,1.0f*Vector3f(1.0f,1.0f,1.0f),rc);
+							mesh.render(rc);
+						}
+						foreach(j;0..objects.soulMoleCastings.length){
+							material.backend.setTransformationScaled(objects.soulMoleCastings[j].soulMole.position,Quaternionf.identity(),Vector3f(1.0f,1.0f,1.0f),rc);
+							mesh.render(rc);
+						}
+						foreach(j;0..objects.soulMoles.length){
+							material.backend.setTransformationScaled(objects.soulMoles[j].position,Quaternionf.identity(),Vector3f(1.0f,1.0f,1.0f),rc);
+							mesh.render(rc);
+						}
+						foreach(j;0..objects.boreCastings.length){
+							material.backend.setTransformationScaled(objects.boreCastings[j].bore.position,Quaternionf.identity(),Vector3f(1.0f,1.0f,1.0f),rc);
+							mesh.render(rc);
+						}
+						foreach(j;0..objects.bores.length){
+							material.backend.setTransformationScaled(objects.bores[j].position,Quaternionf.identity(),Vector3f(1.0f,1.0f,1.0f),rc);
+							mesh.render(rc);
+						}
+						foreach(j;0..objects.haloOfEarthCastings.length){
+							foreach(k;objects.haloOfEarthCastings[j].haloOfEarth.numDespawned..objects.haloOfEarthCastings[j].haloOfEarth.numSpawned){
+								material.backend.setTransformationScaled(objects.haloOfEarthCastings[j].haloOfEarth.rocks[k].position,objects.haloOfEarthCastings[j].haloOfEarth.rocks[k].rotation,haloRockSize/2.0f*Vector3f(1.0f,1.0f,1.0f),rc);
+								mesh.render(rc);
+							}
+						}
+						foreach(j;0..objects.haloOfEarths.length){
+							foreach(k;objects.haloOfEarths[j].numDespawned..objects.haloOfEarths[j].numSpawned){
+								material.backend.setTransformationScaled(objects.haloOfEarths[j].rocks[k].position,objects.haloOfEarths[j].rocks[k].rotation,haloRockSize/2.0f*Vector3f(1.0f,1.0f,1.0f),rc);
+								mesh.render(rc);
+							}
+						}
+						foreach(j;0..objects.eruptDebris.length){
+							material.backend.setTransformationScaled(objects.eruptDebris[j].position,objects.eruptDebris[j].rotation,0.4f*Vector3f(1.0f,1.0f,1.0f),rc);
+							mesh.render(rc);
+						}
+						foreach(j;0..objects.earthflingProjectiles.length){
+							material.backend.setTransformationScaled(objects.earthflingProjectiles[j].position,objects.earthflingProjectiles[j].rotation,0.3f*Vector3f(1.0f,1.0f,1.0f),rc);
+							mesh.render(rc);
+						}
+						foreach(j;0..objects.flummoxProjectiles.length){
+							material.backend.setTransformationScaled(objects.flummoxProjectiles[j].position,objects.flummoxProjectiles[j].rotation,1.25f*Vector3f(1.0f,1.0f,1.0f),rc);
+							mesh.render(rc);
+						}
+						foreach(j;0..objects.boulderdashProjectiles.length){
+							material.backend.setTransformationScaled(objects.boulderdashProjectiles[j].position,objects.boulderdashProjectiles[j].rotation,0.3f*Vector3f(1.0f,1.0f,1.0f),rc);
+							mesh.render(rc);
+						}
+						foreach(j;0..objects.bombardmentDrops.length){
+							material.backend.setTransformationScaled(objects.bombardmentDrops[j].position,objects.bombardmentDrops[j].rotation,1.875f*Vector3f(1.0f,1.0f,1.0f),rc);
+							mesh.render(rc);
+						}
+						foreach(j;0..objects.rockForms.length){
+							auto target=objects.rockForms[j].target;
+							auto positionRotation=state.movingObjectReadById!((ref objects,i)=>tuple(objects.center(i),objects.rotations[i]), function Tuple!(Vector3f,Quaternionf)(){ return typeof(return).init; })(target);
+							auto position=positionRotation[0], rotation=positionRotation[1];
+							if(isNaN(position.x)) continue;
+							auto scale=objects.rockForms[j].scale*objects.rockForms[j].relativeScale;
+							material.backend.setTransformationScaled(position,rotation,scale*Vector3f(1.0f,1.0f,1.0f),rc);
+							mesh.render(rc);
+						}
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.swarmCastings.length||objects.swarms.length||objects.fallenProjectiles.length)){
+					// TODO: render bug shadows?
+					auto material=self.bug.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					auto mesh=self.bug.mesh;
+					void renderBug(bool fallen=false)(ref Bug!B bug){
+						material.backend.setSpriteTransformationScaled(bug.position,fallen?0.5f*bug.scale:bug.scale,rc);
+						mesh.render(rc);
+					}
+					foreach(j;0..objects.swarmCastings.length)
+						foreach(k;0..objects.swarmCastings[j].swarm.bugs.length)
+							renderBug(objects.swarmCastings[j].swarm.bugs[k]);
+					foreach(j;0..objects.swarms.length){
+						if(objects.swarms[j].status==SwarmStatus.dispersing){
+							material.backend.setAlpha(Bug!B.alpha/64.0f*(swarmDispersingFrames-objects.swarms[j].frame));
+						}else material.backend.setAlpha(Bug!B.alpha);
+						foreach(k;0..objects.swarms[j].bugs.length)
+							renderBug(objects.swarms[j].bugs[k]);
+					}
+					foreach(j;0..objects.fallenProjectiles.length){
+						if(objects.fallenProjectiles[j].status==SwarmStatus.dispersing){
+							material.backend.setAlpha(Bug!B.alpha/64.0f*(fallenProjectileDispersingFrames-objects.fallenProjectiles[j].frame));
+						}else material.backend.setAlpha(Bug!B.alpha);
+						foreach(k;0..objects.fallenProjectiles[j].bugs.length)
+							renderBug!true(objects.fallenProjectiles[j].bugs[k]);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.protectiveSwarmCastings.length||objects.protectiveSwarms.length)){
+					// TODO: render bug shadows?
+					auto material=self.protectiveBug.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					void renderProtectiveBug(ref ProtectiveBug!B protectiveBug,Vector3f position,Quaternionf rotation){
+						material.backend.setSpriteTransformationScaled(position+rotate(rotation,protectiveBug.position),protectiveBug.scale,rc);
+						auto mesh=self.protectiveBug.getFrame(protectiveBug.frame%self.protectiveBug.numFrames);
+						mesh.render(rc);
+					}
+					void renderProtectiveSwarm(ref ProtectiveSwarm!B protectiveSwarm){
+						material.backend.setAlpha(ProtectiveBug!B.alpha*protectiveSwarm.alpha);
+						auto positionRotation=state.movingObjectReadById!((ref objects,i)=>tuple(objects.center(i),objects.rotations[i]),()=>Tuple!(Vector3f,Quaternionf).init)(protectiveSwarm.target);
+						auto position=positionRotation[0],rotation=positionRotation[1];
+						if(isNaN(position.x)) return;
+						foreach(k;0..protectiveSwarm.bugs.length)
+							renderProtectiveBug(protectiveSwarm.bugs[k],position,rotation);
+					}
+					foreach(j;0..objects.protectiveSwarmCastings.length) renderProtectiveSwarm(objects.protectiveSwarmCastings[j].protectiveSwarm);
+					foreach(j;0..objects.protectiveSwarms.length) renderProtectiveSwarm(objects.protectiveSwarms[j]);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.airShieldCastings.length||objects.airShields.length)){
+					B.disableDepthMask();
+					B.enableCulling();
+					scope(success) B.enableDepthMask();
+					auto material=self.airShield.material;
+					auto effectMaterial=self.airShieldEffect.material;
+					void renderAirShield(ref AirShield!B airShield){
+						auto material=airShield.hydro?self.bubbleArmorMaterial():material; // Hydro mod: a sea-blue bubble
+						B.shadelessMorphMaterialBackend.bind(material,rc);
+						B.enableTransparency();
+						B.disableDepthMask();
+						auto target=airShield.target;
+						auto positionRotationBoxSize=state.movingObjectReadById!((ref objects,i)=>tuple(objects.center(i),objects.positions[i],objects.rotations[i],boxSize(objects.sacObject.largeHitbox(Quaternionf.identity(),objects.scales[i],objects.animationStates[i],objects.frames[i]/updateAnimFactor))), function Tuple!(Vector3f,Vector3f,Quaternionf,Vector3f)(){ return typeof(return).init; })(target);
+						auto position=positionRotationBoxSize[0], rawPosition=positionRotationBoxSize[1], rotation=positionRotationBoxSize[2], boxSize=positionRotationBoxSize[3];
+						if(isNaN(position.x)) return;
+						auto scale=airShield.scale+0.05f*(1.0f*sin(2.0f*pi!float*2.0f*airShield.frame/updateFPS));
+						boxSize.x=boxSize.y=sqrt(0.5f*(boxSize.x^^2+boxSize.y^^2));
+						auto dimensions=Vector3f(2.0f,2.0f,1.5f)*boxSize;
+						B.shadelessMorphMaterialBackend.setTransformationScaled(position,rotation,scale*dimensions,rc);
+						foreach(v;0..3){
+							auto mesh1Mesh2Progress=self.airShield.getFrame(airShield.frame+20*v,airShield.frame);
+							auto mesh1=mesh1Mesh2Progress[0], mesh2=mesh1Mesh2Progress[1], progress=mesh1Mesh2Progress[2];
+							B.shadelessMorphMaterialBackend.setMorphProgress(progress);
+							mesh1.morph(mesh2,rc);
+						}
+						B.shadelessMorphMaterialBackend.unbind(material,rc);
+						if(airShield.hydro){ // Hydro mod: Bubble Armor - bubbles drifting up inside, no sparkles
+							auto bmat=self.fxMaterial(self.bubbleSpriteMat,"bubble.png");
+							if(!self.bubbleSpriteMesh) self.bubbleSpriteMesh=makeSpriteMeshes!B(1,1,1.0f,1.0f)[0];
+							bmat.bind(rc);
+							foreach(ref particle;airShield.particles.data){
+								auto frame=particle.frame;
+								auto rise=0.04f*frame/updateAnimFactor;
+								auto location=Vector3f(particle.radius*cos(particle.θ),particle.radius*sin(particle.θ),particle.height+rise)*airShield.scale;
+								auto pposition=rawPosition+rotate(rotation,location);
+								auto size=(0.12f+0.22f*fract(particle.radius*7.31f))*airShield.scale;
+								B.shadelessMaterialBackend.setSpriteTransformationScaled(pposition,size,rc);
+								B.shadelessMaterialBackend.setAlpha(min(1.0f,(16*updateAnimFactor-frame)/(4.0f*updateAnimFactor)));
+								self.bubbleSpriteMesh.render(rc);
+							}
+							bmat.unbind(rc);
+							return;
+						}
+						effectMaterial.bind(rc);
+						foreach(ref particle;airShield.particles.data){
+							auto location=Vector3f(particle.radius*cos(particle.θ),particle.radius*sin(particle.θ),particle.height)*airShield.scale;
+							auto pposition=rawPosition+rotate(rotation,location);
+							auto frame=particle.frame;
+							B.shadelessMaterialBackend.setSpriteTransformationScaled(pposition,scale,rc);
+							auto pmesh=self.airShieldEffect.getFrame(frame%self.airShieldEffect.numFrames);
+							pmesh.render(rc);
+						}
+						effectMaterial.unbind(rc);
+					}
+					foreach(ref airShieldCasting;objects.airShieldCastings.data) renderAirShield(airShieldCasting.airShield);
+					foreach(ref airShield;objects.airShields.data) renderAirShield(airShield);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.freezes.length){
+					auto material=self.freeze.material;
+					auto mesh=self.freeze.mesh;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					void renderFreeze(ref Freeze!B freeze){
+						auto scale=freeze.scale;
+						auto creature=freeze.creature;
+						auto hitbox=state.movingObjectReadById!((ref objects,i){
+							auto hitbox=objects.sacObject.largeHitbox(objects.rotations[i],objects.scales[i],objects.animationStates[i],objects.frames[i]/updateAnimFactor);
+							hitbox[0]+=objects.positions[i];
+							hitbox[1]+=objects.positions[i];
+							return hitbox;
+						}, ()=>(Vector3f[2]).init)(creature);
+						auto center=boxCenter(hitbox), size=boxSize(hitbox);
+						if(isNaN(center.x)) return;
+						material.backend.setTransformationScaled(center,Quaternionf.identity(),scale*size,rc);
+						mesh.render(rc);
+					}
+					foreach(ref freeze;objects.freezes.data) renderFreeze(freeze);
+				}
+				static if(mode==RenderMode.opaque) if(objects.slimeCastings.length){
+					auto material=self.slime.material;
+					auto mesh=self.slime.mesh;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					void renderSlime(ref SlimeCasting!B slime){
+						auto scale=min(1.0f,slime.progress/slime.progressThreshold);
+						auto position=1.0f-1.0f/(1.0f-slime.progressThreshold)*max(0.0f,slime.progress-slime.progressThreshold);
+						auto offset=Vector3f(0.0f,0.0f,position*slime.heightOffset);
+						auto creature=slime.creature;
+						import animations;
+						auto sizeCenter=state.movingObjectReadById!((ref objects,i){
+							auto hitbox=objects.sacObject.largeHitbox(Quaternionf.identity(),objects.scales[i],AnimationState.stance1,0);
+							hitbox[0]+=objects.positions[i];
+							hitbox[1]+=objects.positions[i];
+							return tuple(boxSize(hitbox).length,boxCenter(hitbox));
+						},()=>tuple(float.nan,Vector3f.init))(creature);
+						auto size=sizeCenter[0],center=sizeCenter[1];
+						if(isNaN(size)) return;
+						material.backend.setTransformationScaled(center+offset,Quaternionf.identity(),scale*size*Vector3f(1.0f,1.0f,1.0f),rc);
+						mesh.render(rc);
+					}
+					foreach(ref slime;objects.slimeCastings.data) renderSlime(slime);
+				}
+				static if(mode==RenderMode.opaque) if(objects.graspingViness.length||objects.vinewallCastings.length||objects.vinewalls.length){
+					auto material=self.vine.material; // TODO: shadowMaterial?
+					auto mesh=self.vine.mesh;
+					material.bind(rc);
+					void renderVine(ref Vine vine,float lengthFactor){
+						if(isNaN(vine.locations[0].x)) return;
+						Matrix4x4f[self.vine.numSegments+1] pose;
+						foreach(i,ref x;pose){
+							auto curve = vine.get(i/float(pose.length-1));
+							auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),curve[1].normalized);
+							//auto rotation=Quaternionf.identity();
+							x=Transformation(rotation,curve[0]/(vine.scale*lengthFactor)).getMatrix4f;
+						}
+						auto scale=vine.scale*lengthFactor*Vector3f(1.0f,1.0f,1.0f);
+						B.boneMaterialBackend.setTransformationScaled(Vector3f(0.0f,0.0f,0.0f),Quaternionf.identity(),scale,rc);
+						B.boneMaterialBackend.setPose(pose);
+						mesh.render(rc);
+					}
+					foreach(ref graspingVines;objects.graspingViness.data)
+						foreach(ref vine;graspingVines.vines)
+							renderVine(vine,graspingVines.lengthFactor);
+					foreach(ref vinewallCasting;objects.vinewallCastings.data)
+						foreach(i,ref vine;vinewallCasting.vinewall.vines[vinewallCasting.vinewall.numDespawned..vinewallCasting.vinewall.numSpawned])
+							renderVine(vine,vinewallCasting.vinewall.lengthFactors[vinewallCasting.vinewall.numDespawned+i]);
+					foreach(ref vinewall;objects.vinewalls.data)
+						foreach(i,ref vine;vinewall.vines[vinewall.numDespawned..vinewall.numSpawned])
+							renderVine(vine,vinewall.lengthFactors[vinewall.numDespawned+i]);
+				}
+				static if(mode==RenderMode.opaque) if(objects.meanstalksCastings.length||objects.meanstalkss.length){
+					auto material=self.meanstalk.material; // TODO: shadowMaterial?
+					auto mesh=self.meanstalk.mesh;
+					material.bind(rc);
+					void renderMeanstalk(ref Meanstalk vine){
+						Matrix4x4f[self.meanstalk.numSegments+1] pose;
+						foreach(i,ref x;pose){
+							auto t=i/float(pose.length-1);
+							auto curve=t<=0.5f?vine.curve0:vine.curve1;
+							auto u=t<=0.5f?2.0f*t:2.0f*t-1.0f;
+							auto v=1.0f-u;
+							auto position=v*v*v*curve[0]+3.0f*v*v*u*curve[1]+3.0f*v*u*u*curve[2]+u*u*u*curve[3];
+							auto tangent=3.0f*v*v*(curve[1]-curve[0])+6.0f*v*u*(curve[2]-curve[1])+3.0f*u*u*(curve[3]-curve[2]);
+							auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),tangent.normalized);
+							x=Transformation(rotation,position).getMatrix4f;
+						}
+						B.boneMaterialBackend.setTransformationScaled(Vector3f(0.0f,0.0f,0.0f),Quaternionf.identity(),Vector3f(1.0f,1.0f,1.0f),rc);
+						B.boneMaterialBackend.setPose(pose);
+						mesh.render(rc);
+					}
+					foreach(ref meanstalksCasting;objects.meanstalksCastings.data)
+						foreach(ref vine;meanstalksCasting.meanstalks.vines[0..meanstalksCasting.meanstalks.numVines])
+							renderMeanstalk(vine);
+					foreach(ref meanstalks;objects.meanstalkss.data){
+						if(meanstalks.hydro) continue;
+						foreach(ref vine;meanstalks.vines[0..meanstalks.numVines])
+							renderMeanstalk(vine);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.rainbowEffects.length){
+					auto material=self.rainbow.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					B.shadelessBoneMaterialBackend.setTransformation(Vector3f(0.0f,0.0f,0.0f),Quaternionf.identity(),rc);
+					auto mesh=self.rainbow.mesh;
+					void renderRainbow(ref RainbowEffect!B rainbow){
+						Matrix4x4f[self.rainbow.numSegments+1] pose;
+						auto start=rainbow.start.position, end=rainbow.end.position;
+						auto direction=(end-start).normalized;
+						float startProgress=0.0f,endProgress=1.0f;
+						enum travelFrames=rainbow.travelFrames, delay=rainbow.delay;
+						auto frame=rainbow.frame;
+						if(frame<travelFrames) endProgress=float(frame)/travelFrames;
+						if(travelFrames+delay<=frame) startProgress=float(frame-(travelFrames+delay))/travelFrames;
+						auto defaultRotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),direction);
+						auto center=0.5f*(start+end);
+						auto rotationAxis=cross(Vector3f(0.0f,0.0f,1.0f),end-start).normalized;
+						if(isNaN(rotationAxis.x)) rotationAxis=Vector3f(0.0f,1.0f,0.0f);
+						auto positionAt(float x){
+							//return (1.0f-x)*start+x*end;
+							static Vector3f xy(Vector3f xyz){ return Vector3f(xyz.x,xyz.y,0.0f); }
+							auto position=xy(center)+rotate(rotationQuaternion(rotationAxis,x*pi!float),xy(start-center));
+							auto dstart=(xy(position)-xy(start)).length, dend=(xy(end)-xy(position)).length;
+							if(dstart==0.0f&&dend==0.0f) return start;
+							position.z+=dend/(dstart+dend)*start.z+dstart/(dstart+dend)*end.z;
+							return position;
+						}
+						auto rotationAt(float x){
+							return rotationQuaternion(rotationAxis,-(1.0f-x)*0.5f*pi!float+x*0.5f*pi!float)*defaultRotation;
+						}
+						foreach(i,ref x;pose){
+							auto relativeProgress=float(i)/self.rainbow.numSegments;
+							auto progress=(1.0f-relativeProgress)*startProgress+relativeProgress*endProgress;
+							x=Transformation(rotationAt(progress),positionAt(progress)).getMatrix4f;
+						}
+						B.shadelessBoneMaterialBackend.setPose(pose);
+						mesh.render(rc);
+					}
+					foreach(j;0..objects.rainbowEffects.length) renderRainbow(objects.rainbowEffects[j]);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.animateDeadEffects.length){
+					auto material=self.animateDead.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					B.shadelessBoneMaterialBackend.setTransformation(Vector3f(0.0f,0.0f,0.0f),Quaternionf.identity(),rc);
+					void renderAnimateDead(ref AnimateDeadEffect!B animateDead){
+						Matrix4x4f[self.animateDead.numSegments+1] pose;
+						auto start=animateDead.start.position, end=animateDead.end.position;
+						auto direction=(end-start).normalized;
+						auto frame=animateDead.frame;
+						auto relativeLength=animateDead.relativeLength;
+						auto startProgress=(1.0f+relativeLength)*float(frame)/animateDead.totalFrames;
+						auto endProgress=startProgress-relativeLength;
+						foreach(i,ref x;pose){
+							auto relativeProgress=float(i)/self.animateDead.numSegments;
+							auto progress=max(0.0f,min((1.0f-relativeProgress)*startProgress+relativeProgress*endProgress,1.0f));
+							auto location=cintp2([[animateDead.start.position,animateDead.startDirection],[animateDead.end.position,animateDead.endDirection]],progress);
+							x=Transformation(rotationBetween(Vector3f(0.0f,0.0f,1.0f),location[1].normalized),location[0]).getMatrix4f;
+						}
+						auto mesh=self.animateDead.getFrame(frame%self.animateDead.numFrames);
+						B.shadelessBoneMaterialBackend.setPose(pose);
+						mesh.render(rc);
+					}
+					foreach(j;0..objects.animateDeadEffects.length) renderAnimateDead(objects.animateDeadEffects[j]);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.hellmouthProjectiles.length){
+					auto material=self.hellmouthProjectile.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					B.shadelessBoneMaterialBackend.setTransformation(Vector3f(0.0f,0.0f,0.0f),Quaternionf.identity(),rc);
+					auto mesh=self.hellmouthProjectile.mesh;
+					void renderHellmouthProjectile(ref HellmouthProjectile!B hellmouthProjectile){
+						Matrix4x4f[self.hellmouthProjectile.numSegments+1] pose;
+						foreach(i,ref x;pose){
+							auto curve=hellmouthProjectile.get(i/float(pose.length-1));
+							auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),curve[1].normalized);
+							x=Transformation(rotation,curve[0]).getMatrix4f;
+						}
+						auto mesh=self.hellmouthProjectile.mesh;
+						B.shadelessBoneMaterialBackend.setPose(pose);
+						mesh.render(rc);
+					}
+					foreach(j;0..objects.hellmouthProjectiles.length) renderHellmouthProjectile(objects.hellmouthProjectiles[j]);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.dragonfireCastings.length||objects.dragonfires.length)){
+					B.disableDepthMask();
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						B.enableDepthMask();
+					}
+					foreach(i,mat;self.dragonfire.obj.materials){
+						B.shadelessMorphMaterialBackend.bind(mat,rc);
+						B.enableTransparency();
+						scope(success) B.shadelessMorphMaterialBackend.unbind(mat,rc);
+						void renderDragonfire(Vector3f position,Vector3f direction,int frame,float scale){
+							auto mesh1Mesh2Progress=self.dragonfire.getFrame(frame%self.dragonfire.numFrames);
+							auto mesh1=mesh1Mesh2Progress[0], mesh2=mesh1Mesh2Progress[1], progress=mesh1Mesh2Progress[2];
+							assert(mesh1.length==mesh2.length&&mesh1.length==self.dragonfire.obj.materials.length);
+							auto intermediate=Vector3f(direction.x,direction.y,0.0f).normalized;
+							auto rotation=rotationBetween(intermediate,direction)*rotationBetween(Vector3f(0.0f,1.0f,0.0f),intermediate);
+							B.shadelessMorphMaterialBackend.setTransformationScaled(position,rotation,scale*Vector3f(1.0f,1.0f,1.0f),rc);
+							B.shadelessMorphMaterialBackend.setMorphProgress(progress);
+							mesh1[i].morph(mesh2[i],rc);
+						}
+						foreach(ref dragonfireCasting;objects.dragonfireCastings.data) with(dragonfireCasting) renderDragonfire(dragonfire.position,dragonfire.direction,dragonfire.frame,scale);
+						foreach(ref dragonfire;objects.dragonfires.data) renderDragonfire(dragonfire.position,dragonfire.direction,dragonfire.frame,dragonfire.scale);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.soulWindCastings.length||objects.soulWinds.length)){
+					auto material=self.soulWind.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					void renderSoulWind(ref SoulWind!B soulWind){
+						auto frame=soulWind.frame;
+						auto position=soulWind.position;
+						auto rotation=facingQuaternion(2*pi!float*frame/(4*updateFPS));
+						B.shadelessMaterialBackend.setTransformation(position,rotation,rc);
+						auto mesh=self.soulWind.getFrame(frame%self.soulWind.numFrames);
+						mesh.render(rc);
+					}
+					foreach(ref soulWindCasting;objects.soulWindCastings.data)
+						renderSoulWind(soulWindCasting.soulWind);
+					foreach(ref soulWind;objects.soulWinds.data)
+						renderSoulWind(soulWind);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.explosionCastings.length){
+					B.disableDepthMask();
+					B.enableCulling();
+					scope(success){
+						B.enableCulling();
+						B.enableDepthMask();
+					}
+					auto material=self.explosionEffect.material;
+					B.shadelessMorphMaterialBackend.bind(material,rc);
+					B.enableTransparency();
+					scope(success) B.shadelessMorphMaterialBackend.unbind(material,rc);
+					void renderExplosionEffect(ref ExplosionEffect effect){
+						auto frame=effect.frame;
+						auto rotation=facingQuaternion(effect.rotationSpeed*frame/updateFPS);
+						auto scale=effect.scale;
+						auto radius=scale*effect.maxRadius;
+						auto position=effect.position+Vector3f(0.0f,0.0f,radius);
+						B.shadelessMorphMaterialBackend.setTransformationScaled(position,rotation,radius*Vector3f(1.1f,1.1f,0.9f),rc);
+						foreach(v;0..3){ // TODO
+							auto mesh1Mesh2Progress=self.explosionEffect.getFrame(frame+20*v,frame);
+							auto mesh1=mesh1Mesh2Progress[0], mesh2=mesh1Mesh2Progress[1], progress=mesh1Mesh2Progress[2];
+							B.shadelessMorphMaterialBackend.setMorphProgress(progress);
+							mesh1.morph(mesh2,rc);
+						}
+					}
+					foreach(ref explosionCasting;objects.explosionCastings.data)
+						foreach(ref effect;explosionCasting.effects)
+							renderExplosionEffect(effect);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&& // TODO: cloud shadows?
+														   (objects.rainOfFrogsCastings.length||
+															objects.rainOfFrogss.length||
+														    objects.plagueCastings.length||
+														    objects.plagues.length||
+														    objects.rainOfFireCastings.length||
+														    objects.rainOfFires.length)
+				){
+					B.disableDepthMask();
+					B.enableCulling();
+					scope(success){
+						B.enableCulling();
+						B.enableDepthMask();
+					}
+					auto material=self.cloud.material;
+					B.shadelessMorphMaterialBackend.bind(material,rc);
+					B.enableTransparency();
+					scope(success) B.shadelessMorphMaterialBackend.unbind(material,rc);
+					void renderCloud(Vector3f position,float radius,float scale,int frame){
+						B.shadelessMorphMaterialBackend.setTransformationScaled(position,Quaternionf.identity(),radius*(0.5f+0.5f*scale)*Vector3f(1.3f,1.3f,0.4f),rc);
+						B.shadelessMorphMaterialBackend.setAlpha(scale);
+						foreach(v;0..20){
+							auto mesh1Mesh2Progress=self.cloud.getFrame(frame+4*updateFPS*v);
+							auto mesh1=mesh1Mesh2Progress[0], mesh2=mesh1Mesh2Progress[1], progress=mesh1Mesh2Progress[2];
+							B.shadelessMorphMaterialBackend.setMorphProgress(progress);
+							mesh1.morph(mesh2,rc);
+						}
+					}
+					foreach(ref rainOfFrogsCasting;objects.rainOfFrogsCastings.data)
+						with(rainOfFrogsCasting.rainOfFrogs) renderCloud(position,spell.effectRange,cloudScale,cloudFrame);
+					foreach(ref rainOfFrogs;objects.rainOfFrogss.data)
+						with(rainOfFrogs) renderCloud(position,spell.effectRange,cloudScale,cloudFrame);
+					foreach(ref plagueCasting;objects.plagueCastings.data)
+						with(plagueCasting.plague) renderCloud(position,spell.effectRange,cloudScale,cloudFrame);
+					foreach(ref plague;objects.plagues.data)
+						with(plague) renderCloud(position,spell.effectRange,cloudScale,cloudFrame);
+					foreach(ref rainOfFireCasting;objects.rainOfFireCastings.data)
+						with(rainOfFireCasting.rainOfFire) renderCloud(position,0.5f*spell.effectRange,cloudScale,cloudFrame);
+					foreach(ref rainOfFire;objects.rainOfFires.data)
+						with(rainOfFire) renderCloud(position,0.5f*spell.effectRange,cloudScale,cloudFrame);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.rainFrogs.length){
+					auto material=self.rainFrog.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					foreach(j;0..objects.rainFrogs.length){
+						auto position=objects.rainFrogs[j].position+Vector3f(0.0f,0.0f,0.5f*self.rainFrog.size);
+						if(auto target=objects.rainFrogs[j].target){
+							auto targetPositionTargetRotation=state.movingObjectReadById!((ref objects,i)=>tuple(objects.positions[i],objects.rotations[i]),()=>Tuple!(Vector3f,Quaternionf).init)(target);
+							auto targetPosition=targetPositionTargetRotation[0], targetRotation=targetPositionTargetRotation[1];
+							position=targetPosition+rotate(targetRotation,position);
+						}
+						auto frame=objects.rainFrogs[j].animationFrame;
+						auto mesh=self.rainFrog.getFrame(frame%self.rainFrog.numFrames);
+						material.backend.setSpriteTransformation(position,rc);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.demonicRifts.length||objects.charmCastings.length||objects.charms.length)){
+					auto material=self.demonicRiftSpirit.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					B.shadelessBoneMaterialBackend.setTransformation(Vector3f(0.0f,0.0f,0.0f),Quaternionf.identity(),rc);
+					void renderDemonicRiftSpirit(ref DemonicRiftSpirit!B demonicRiftSpirit){
+						auto scale=demonicRiftSpirit.scale;
+						auto frame=demonicRiftSpirit.frame;
+						Matrix4x4f[self.demonicRiftSpirit.numSegments+1] pose;
+						foreach(i,ref x;pose){
+							auto progress=float(i)/self.demonicRiftSpirit.numSegments;
+							auto curve=demonicRiftSpirit.get(progress);
+							x=Transformation(rotationBetween(Vector3f(0.0f,0.0f,1.0f),curve[1].normalized),curve[0]).getMatrix4f;
+							foreach(k;0..3) foreach(l;0..3) x.arrayof[k*4+l]*=scale;
+						}
+						auto mesh=self.demonicRiftSpirit.getFrame(frame%self.demonicRiftSpirit.numFrames);
+						B.shadelessBoneMaterialBackend.setPose(pose);
+						mesh.render(rc);
+					}
+					foreach(ref demonicRift;objects.demonicRifts.data)
+						foreach(ref spirit;demonicRift.spirits[demonicRift.numDespawned..demonicRift.numSpawned])
+							renderDemonicRiftSpirit(spirit);
+					void renderCharmSpirit(ref CharmSpirit!B charmSpirit){
+						auto scale=0.5f;
+						auto frame=charmSpirit.frame;
+						Matrix4x4f[self.demonicRiftSpirit.numSegments+1] pose;
+						foreach(i,ref x;pose){
+							auto progress=float(i)/self.demonicRiftSpirit.numSegments;
+							auto curve=charmSpirit.get(progress);
+							x=Transformation(rotationBetween(Vector3f(0.0f,0.0f,1.0f),curve[1].normalized),curve[0]).getMatrix4f;
+							foreach(k;0..3) foreach(l;0..3) x.arrayof[k*4+l]*=scale;
+						}
+						auto mesh=self.demonicRiftSpirit.getFrame(frame%self.demonicRiftSpirit.numFrames);
+						B.shadelessBoneMaterialBackend.setPose(pose);
+						mesh.render(rc);
+					}
+					foreach(ref charmCasting;objects.charmCastings.data)
+						foreach(ref spirit;charmCasting.charm.spirits)
+							renderCharmSpirit(spirit);
+					foreach(ref charm;objects.charms.data)
+						foreach(ref spirit;charm.spirits)
+							renderCharmSpirit(spirit);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.demonicRifts.length||objects.demonicRiftCastings.length)){
+					auto material=self.demonicRiftBorder.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					void renderDemonicRiftBorder(ref DemonicRift!B rift){
+						auto position=rift.position;
+						auto heightScale=rift.heightScale;
+						auto radius=rift.radius;
+						B.shadelessMaterialBackend.setTransformationScaled(position,Quaternionf.identity(),radius*Vector3f(1.0f,1.0f,heightScale),rc);
+						B.shadelessMaterialBackend.setAlpha(heightScale^^2);
+						auto mesh=self.demonicRiftBorder.getFrame(rift.frame%self.demonicRiftBorder.numFrames);
+						mesh.render(rc);
+					}
+					foreach(j;0..objects.demonicRiftCastings.length) renderDemonicRiftBorder(objects.demonicRiftCastings[j].demonicRift);
+					foreach(j;0..objects.demonicRifts.length) renderDemonicRiftBorder(objects.demonicRifts[j]);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.demonicRiftEffects.length){
+					auto material=self.demonicRiftEffect.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					foreach(j;0..objects.demonicRiftEffects.length){
+						auto position=objects.demonicRiftEffects[j].position;
+						//auto radius=objects.demonicRiftEffects[j].radius;
+						auto radius=DemonicRift!B.radius;
+						auto scale=objects.demonicRiftEffects[j].scale;
+						B.shadelessMaterialBackend.setTransformationScaled(position,Quaternionf.identity(),scale*radius*Vector3f(1.0f,1.0f,1.0f),rc);
+						B.shadelessMaterialBackend.setEnergy(20.0f*scale^^4);
+						auto mesh=self.demonicRiftEffect.getFrame(objects.demonicRiftEffects[j].frame%self.demonicRiftEffect.numFrames);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.healingAuras.length){
+					B.disableDepthMask();
+					B.enableCulling();
+					auto material=self.healingAura.material;
+					B.shadelessMorphMaterialBackend.bind(material,rc);
+					B.enableAdditive();
+					scope(success){
+						B.enableDepthMask();
+						B.shadelessMorphMaterialBackend.unbind(material,rc);
+					}
+					void renderHealingAura(ref HealingAura!B healingAura){
+						auto target=healingAura.target;
+						auto positionRotationBoxSize=state.movingObjectReadById!((ref objects,i)=>tuple(objects.center(i),objects.positions[i],objects.rotations[i],boxSize(objects.sacObject.largeHitbox(Quaternionf.identity(),objects.scales[i],objects.animationStates[i],objects.frames[i]/updateAnimFactor))), function Tuple!(Vector3f,Vector3f,Quaternionf,Vector3f)(){ return typeof(return).init; })(target);
+						auto position=positionRotationBoxSize[0], rawPosition=positionRotationBoxSize[1], rotation=positionRotationBoxSize[2], boxSize=positionRotationBoxSize[3];
+						if(isNaN(position.x)) return;
+						auto scale=healingAura.scale;//+0.05f*(1.0f*sin(2.0f*pi!float*2.0f*healingAura.frame/updateFPS));
+						boxSize.x=boxSize.y=sqrt(0.5f*(boxSize.x^^2+boxSize.y^^2));
+						auto dimensions=Vector3f(1.9f,1.9f,1.45f)*boxSize;
+						B.shadelessMorphMaterialBackend.setTransformationScaled(position,rotation,-scale*dimensions,rc);
+						foreach(v;0..3){
+							auto mesh1Mesh2Progress=self.healingAura.getFrame(healingAura.frame+20*v,healingAura.frame);
+							auto mesh1=mesh1Mesh2Progress[0], mesh2=mesh1Mesh2Progress[1], progress=mesh1Mesh2Progress[2];
+							B.shadelessMorphMaterialBackend.setMorphProgress(progress);
+							mesh1.morph(mesh2,rc);
+						}
+					}
+					foreach(ref healingAura;objects.healingAuras.data) renderHealingAura(healingAura);
+				}
+				static if(mode==RenderMode.opaque) if(objects.spikes.length||objects.wallOfSpikesCastings.length||objects.wallOfSpikess.length){
+					auto material=self.spike.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					void renderSpike(float scale,Vector3f position,Vector3f direction){
+						auto ndirection=direction/direction.z;
+						auto modelMatrix=translationMatrix(position)*scaleMatrix(Vector3f(scale,scale,scale*direction.z))*shearMatrix(Axis.z,ndirection.x,ndirection.y);
+						B.defaultMaterialBackend.setModelViewMatrix(rc.viewMatrix*modelMatrix);
+						auto mesh=self.spike.mesh;
+						mesh.render(rc);
+					}
+					foreach(ref spike;objects.spikes.data) renderSpike(spike.currentScale,spike.position,spike.direction);
+					foreach(ref wallOfSpikesCasting;objects.wallOfSpikesCastings.data){
+						foreach(i,ref spike;wallOfSpikesCasting.wallOfSpikes.spikes[wallOfSpikesCasting.wallOfSpikes.numDespawned..wallOfSpikesCasting.wallOfSpikes.numSpawned]){
+							renderSpike(
+								spike.scale*wallOfSpikesCasting.wallOfSpikes.spikeScale,
+								spike.position,
+								spike.direction/wallOfSpikesCasting.wallOfSpikes.spikeScale,
+							);
+						}
+					}
+					foreach(ref wallOfSpikes;objects.wallOfSpikess.data){
+						foreach(i,ref spike;wallOfSpikes.spikes[wallOfSpikes.numDespawned..wallOfSpikes.numSpawned]){
+							renderSpike(
+								spike.scale*wallOfSpikes.spikeScale,
+								spike.position,
+								spike.direction/wallOfSpikes.spikeScale,
+							);
+						}
+						}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.firewalls.length||objects.firewallCastings.length)){
+					auto material=self.firewall.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					void renderFirewall(ref Firewall!B firewall){
+						auto direction=firewall.direction;
+						auto rotation=rotationBetween(Vector3f(0.0f,1.0f,0.0f),Vector3f(direction.x,direction.y,0.0f));
+						B.shadelessBoneMaterialBackend.setTransformation(Vector3f(0.0f,0.0f,0.0f),Quaternionf.identity(),rc);
+						//auto alpha=pi!float*frame/float(totalFrames);
+						//auto energy=0.375f+14.625f*(0.5f+0.25f*cos(7.0f*alpha)+0.25f*sin(11.0f*alpha));
+						//B.shadelessBoneMaterialBackend.setEnergy(energy);
+						auto frame=firewall.frame;
+						auto mesh=self.firewall.getFrame(frame%self.firewall.numFrames);
+						enum numSegments=self.firewall.numSegments;
+						enum thickness=firewall.wallThickness;
+						auto range=firewall.spell.effectRange;
+						auto left=firewall.left,right=firewall.right;
+						Matrix4x4f[numSegments+1] pose;
+						foreach(k,ref x;pose){
+							auto t=(range-2.5f)*(float(numSegments)/(numSegments-2)*2.0f)*(float(k)/numSegments-0.5f);
+							auto scale=firewall.scale(t);
+							auto position=firewall.get(t,state);
+							auto fixup=max(0.0f,position.z-firewall.low(t,state));
+							x=Transformation(rotation,position-fixup).getMatrix4f*scaleMatrix(scale*Vector3f(thickness,0.0f,firewall.height(t)+fixup));
+						}
+						B.shadelessBoneMaterialBackend.setPose(pose);
+						mesh.render(rc);
+					}
+					foreach(j;0..objects.firewallCastings.length)
+						if(!objects.firewallCastings[j].firewall.hydro) renderFirewall(objects.firewallCastings[j].firewall);
+					foreach(j;0..objects.firewalls.length)
+						if(!objects.firewalls[j].hydro) renderFirewall(objects.firewalls[j]);
+					// Hydro mod: the Tidal Wall - pouring water on the same wall mesh, and coral along its foot
+					bool anyTidal=false;
+					foreach(j;0..objects.firewallCastings.length) anyTidal|=objects.firewallCastings[j].firewall.hydro;
+					foreach(j;0..objects.firewalls.length) anyTidal|=objects.firewalls[j].hydro;
+					if(anyTidal){
+						material.unbind(rc);
+						auto wmat=self.waterfallMaterial();
+						wmat.bind(rc);
+						B.disableCulling();
+						foreach(j;0..objects.firewallCastings.length)
+							if(objects.firewallCastings[j].firewall.hydro) renderFirewall(objects.firewallCastings[j].firewall);
+						foreach(j;0..objects.firewalls.length)
+							if(objects.firewalls[j].hydro) renderFirewall(objects.firewalls[j]);
+						B.enableCulling();
+						wmat.unbind(rc);
+						auto cmat=self.fxMaterial(self.coralMat,"coral.png");
+						if(!self.coralMesh) self.coralMesh=makeSpriteMeshes!B(1,1,2.2f,2.2f)[0];
+						cmat.bind(rc);
+						void renderReef(ref Firewall!B fw){
+							auto orthogonal=Vector3f(fw.direction.y,-fw.direction.x,0.0f);
+							auto grow=min(1.0f,fw.top/2.0f);
+							if(grow<=0.0f) return;
+							foreach(k;-40..41){
+								auto t=1.6f*k;
+								if(t<fw.left||t>fw.right) continue;
+								uint h=cast(uint)(k*2654435761u)^0x9e37u;
+								auto side=((h>>3)%100)/100.0f-0.5f;
+								auto p=fw.get(t+0.6f*(((h>>11)%100)/100.0f-0.5f),state)+0.5f*fw.wallThickness*side*orthogonal;
+								auto sc=(0.7f+0.5f*((h>>17)%100)/100.0f)*grow;
+								p.z=state.getHeight(p)+0.9f*sc;
+								B.shadelessMaterialBackend.setSpriteTransformationScaled(p,sc,rc);
+								B.shadelessMaterialBackend.setAlpha(min(1.0f,fw.top/1.0f));
+								self.coralMesh.render(rc);
+							}
+						}
+						foreach(j;0..objects.firewallCastings.length)
+							if(objects.firewallCastings[j].firewall.hydro) renderReef(objects.firewallCastings[j].firewall);
+						foreach(j;0..objects.firewalls.length)
+							if(objects.firewalls[j].hydro) renderReef(objects.firewalls[j]);
+						cmat.unbind(rc);
+						material.bind(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.wailingWallSpirits.length||objects.wailingWalls.length||objects.wailingWallCastings.length)){
+					auto material=self.wailingWallSpirit.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					B.shadelessBoneMaterialBackend.setTransformation(Vector3f(0.0f,0.0f,0.0f),Quaternionf.identity(),rc);
+					void renderWailingWallSpirit(ref WailingWallSpirit!B wailingWallSpirit){
+						auto scale=wailingWallSpirit.scale;
+						auto frame=wailingWallSpirit.frame;
+						Matrix4x4f[self.wailingWallSpirit.numSegments+1] pose;
+						foreach(i,ref x;pose){
+							auto progress=float(i)/self.wailingWallSpirit.numSegments;
+							auto curve=wailingWallSpirit.get(progress);
+							if(wailingWallSpirit.status==WailingWallSpiritStatus.patrolling)
+								curve[0].z+=state.getHeight(curve[0]);
+							x=Transformation(rotationBetween(Vector3f(0.0f,0.0f,1.0f),curve[1].normalized),curve[0]).getMatrix4f;
+							foreach(k;0..3) foreach(l;0..3) x.arrayof[k*4+l]*=scale;
+						}
+						auto mesh=self.wailingWallSpirit.getFrame(frame%self.wailingWallSpirit.numFrames);
+						B.shadelessBoneMaterialBackend.setPose(pose);
+						mesh.render(rc);
+					}
+					foreach(ref spirit;objects.wailingWallSpirits.data)
+						renderWailingWallSpirit(spirit);
+					foreach(j;0..objects.wailingWallCastings.length){
+						auto wailingWall=&objects.wailingWallCastings[j].wailingWall;
+						foreach(ref spirit;wailingWall.spirits[wailingWall.numDespawned..wailingWall.numSpawned])
+							renderWailingWallSpirit(spirit);
+					}
+					foreach(ref wailingWall;objects.wailingWalls.data)
+						foreach(ref spirit;wailingWall.spirits[wailingWall.numDespawned..wailingWall.numSpawned])
+							renderWailingWallSpirit(spirit);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.wailingWalls.length||objects.wailingWallCastings.length)){
+					auto material=self.wailingWall.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					void renderWailingWall(ref WailingWall!B wailingWall){
+						if(wailingWall.top==0.0f) return;
+						auto direction=wailingWall.direction;
+						auto rotation=rotationBetween(Vector3f(0.0f,1.0f,0.0f),Vector3f(direction.x,direction.y,0.0f));
+						B.shadelessBoneMaterialBackend.setTransformation(Vector3f(0.0f,0.0f,0.0f),Quaternionf.identity(),rc);
+						//auto alpha=pi!float*frame/float(totalFrames);
+						//auto energy=0.375f+14.625f*(0.5f+0.25f*cos(7.0f*alpha)+0.25f*sin(11.0f*alpha));
+						//B.shadelessBoneMaterialBackend.setEnergy(energy);
+						auto frame=wailingWall.frame;
+						auto mesh=self.wailingWall.getFrame(frame%self.wailingWall.numFrames);
+						enum numSegments=self.wailingWall.numSegments;
+						enum thickness=wailingWall.wallThickness;
+						auto range=wailingWall.spell.effectRange;
+						auto left=wailingWall.left,right=wailingWall.right;
+						Matrix4x4f[numSegments+1] pose;
+						foreach(k,ref x;pose){
+							auto t=(range-2.5f)*(float(numSegments)/(numSegments-2)*2.0f)*(float(k)/numSegments-0.5f);
+							auto scale=wailingWall.scale(t);
+							auto position=wailingWall.get(t,state);
+							auto fixup=max(0.0f,position.z-wailingWall.low(t,state));
+							x=Transformation(rotation,position-fixup).getMatrix4f*scaleMatrix(scale*Vector3f(thickness,0.0f,wailingWall.height(t)+fixup));
+						}
+						B.shadelessBoneMaterialBackend.setPose(pose);
+						mesh.render(rc);
+					}
+					foreach(j;0..objects.wailingWallCastings.length)
+						renderWailingWall(objects.wailingWallCastings[j].wailingWall);
+					foreach(j;0..objects.wailingWalls.length)
+						renderWailingWall(objects.wailingWalls[j]);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.fences.length){
+					static foreach(phase;0..2){{
+						auto material=self.fence.materials[phase];
+						material.bind(rc);
+						scope(success) material.unbind(rc);
+						foreach(ref fence;objects.fences.data){
+							foreach(ref post;fence.posts[fence.numDespawned..fence.numSpawned]){
+								auto scale=post.scale*self.fence.size;
+								material.backend.setSpriteTransformationScaled(post.position,scale,rc);
+								static if(phase==0) self.quad.render(rc);
+								else self.fence.getFrame(post.frame%self.fence.numFrames).render(rc);
+							}
+						}
+					}}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.intestinalVaporizations.length||objects.intestinalVaporizationCastings.length)){
+					auto material=self.intestinalVaporization.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					void renderIntestinalVaporization(ref IntestinalVaporization!B intestinalVaporization){
+						if(intestinalVaporization.status!=IntestinalVaporizationStatus.flying) return;
+						auto position=intestinalVaporization.position;
+						auto frame=intestinalVaporization.frame;
+						auto mesh=self.intestinalVaporization.getFrame(frame%self.intestinalVaporization.numFrames);
+						material.backend.setSpriteTransformation(position,rc);
+						mesh.render(rc);
+					}
+					foreach(j;0..objects.intestinalVaporizationCastings.length)
+						renderIntestinalVaporization(objects.intestinalVaporizationCastings[j].intestinalVaporization);
+					foreach(j;0..objects.intestinalVaporizations.length)
+						renderIntestinalVaporization(objects.intestinalVaporizations[j]);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.intestinalVaporizationEffects.length){
+					auto material=self.intestinalVaporizationEffect.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					void renderIntestinalVaporizationEffect(ref IntestinalVaporizationEffect!B intestinalVaporizationEffect){
+						auto scale=max(0.75f,min(intestinalVaporizationEffect.scale,3.0f));
+						auto position=intestinalVaporizationEffect.position;
+						auto frame=intestinalVaporizationEffect.frame;
+						auto mesh=self.intestinalVaporizationEffect.getFrame(frame%self.intestinalVaporization.numFrames);
+						material.backend.setSpriteTransformationScaled(position,scale,rc);
+						mesh.render(rc);
+					}
+					foreach(j;0..objects.intestinalVaporizationEffects.length)
+						renderIntestinalVaporizationEffect(objects.intestinalVaporizationEffects[j]);
+				}
+				static if(mode==RenderMode.opaque) if(objects.blindRageCastings.length||objects.blindRages.length){
+					foreach(i,mat;self.blindRage.obj.materials){
+						B.morphMaterialBackend.bind(mat,rc);
+						scope(success) B.morphMaterialBackend.unbind(mat,rc);
+						void renderBlindRage(Vector3f position,Vector3f direction,BlindRageStatus status,int frame,float scale){
+							final switch(status) with(BlindRageStatus){
+								case casting: frame=self.blindRage.castFrame(frame); break;
+								case flying: frame=self.blindRage.flyFrame(frame); break;
+								case formingFist: frame=self.blindRage.fistFrame(frame); break;
+								case exploding: return;
+							}
+							auto mesh1Mesh2Progress=self.blindRage.getFrame(frame%self.blindRage.numFrames);
+							auto mesh1=mesh1Mesh2Progress[0], mesh2=mesh1Mesh2Progress[1], progress=mesh1Mesh2Progress[2];
+							assert(mesh1.length==mesh2.length&&mesh1.length==self.blindRage.obj.materials.length);
+							auto intermediate=Vector3f(direction.x,direction.y,0.0f).normalized;
+							auto rotation=rotationBetween(intermediate,direction)*rotationBetween(Vector3f(0.0f,1.0f,0.0f),intermediate);
+							B.morphMaterialBackend.setTransformationScaled(position,rotation,scale*Vector3f(1.0f,1.0f,1.0f),rc);
+							B.morphMaterialBackend.setMorphProgress(progress);
+							mesh1[i].morph(mesh2[i],rc);
+						}
+						foreach(ref blindRageCasting;objects.blindRageCastings.data) with(blindRageCasting) renderBlindRage(blindRage.position,blindRage.direction,blindRage.status,blindRage.frame,blindRage.scale);
+						foreach(ref blindRage;objects.blindRages.data) renderBlindRage(blindRage.position,blindRage.direction,blindRage.status,blindRage.frame,blindRage.scale);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.blindRages.length){
+					auto material=self.blindRageExplosion.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					void renderBlindRageExplosion(int frame,Vector3f position,float scale_=1.0f){
+						auto mesh=self.blindRageExplosion.getFrame(frame);
+						auto scale=scale_*self.blindRageExplosion.maxScale/self.blindRageExplosion.numFrames*frame;
+						B.shadelessMaterialBackend.setTransformationScaled(position,Quaternionf.identity(),Vector3f(scale,scale,1.0f),rc);
+						mesh.render(rc);
+					}
+					foreach(j;0..objects.blindRages.length){
+						if(objects.blindRages[j].status!=BlindRageStatus.exploding) continue;
+						auto frame=objects.blindRages[j].frame;
+						auto position=objects.blindRages[j].position+Vector3f(0.0f,0.0f,self.blindRageExplosion.maxOffset/self.blindRageExplosion.numFrames*objects.blindRages[j].frame);
+						renderBlindRageExplosion(frame,position);
+					}
+					foreach(j;0..objects.altarDestructions.length){
+						enum delay=AltarDestruction.disappearDuration+AltarDestruction.floatDuration;
+						if(objects.altarDestructions[j].frame<delay) continue;
+						auto frame=(objects.altarDestructions[j].frame-delay)*(self.blindRageExplosion.numFrames-1)/AltarDestruction.explodeDuration;
+						auto position=objects.altarDestructions[j].position;
+						renderBlindRageExplosion(frame,position,20.0f);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.blindRageEffects.length){
+					auto sacParticle=SacParticle!B.get(ParticleType.castPyro2);
+					auto mat=sacParticle.material;
+					mat.bind(rc);
+					scope(success) mat.unbind(rc);
+					void renderBlindRageEffect(ref BlindRageEffect!B blindRageEffect){
+						auto target=blindRageEffect.target;
+						auto positionRotation=state.movingObjectReadById!((ref objects,i)=>tuple(objects.positions[i],objects.rotations[i]), function Tuple!(Vector3f,Quaternionf)(){ return typeof(return).init; })(target);
+						auto position=positionRotation[0], rotation=positionRotation[1];
+						if(isNaN(position.x)) return;
+						foreach(ref particle;blindRageEffect.particles.data){
+							auto location=Vector3f(particle.radius*cos(particle.θ),particle.radius*sin(particle.θ),particle.height);
+							auto pposition=position+rotate(rotation,location);
+							auto frame=particle.frame;
+							auto scale=0.5f;
+							B.shadelessMaterialBackend.setSpriteTransformationScaled(pposition,scale,rc);
+							auto pmesh=sacParticle.getMesh(frame);
+							pmesh.render(rc);
+						}
+					}
+					foreach(j;0..objects.blindRageEffects.length)
+						renderBlindRageEffect(objects.blindRageEffects[j]);
+				}
+				static if(mode==RenderMode.opaque) if(objects.bovineInterventions.length){
+					foreach(i,mat;self.cow.obj.materials){
+						B.morphMaterialBackend.bind(mat,rc);
+						scope(success) B.morphMaterialBackend.unbind(mat,rc);
+						void renderCow(Vector3f position,Quaternionf rotation,int frame){
+							auto mesh1Mesh2Progress=self.cow.getFrame(frame);
+							auto mesh1=mesh1Mesh2Progress[0], mesh2=mesh1Mesh2Progress[1], progress=mesh1Mesh2Progress[2];
+							assert(mesh1.length==mesh2.length&&mesh1.length==self.cow.obj.materials.length);
+							B.morphMaterialBackend.setTransformationScaled(position,rotation,4.0f*Vector3f(1.0f,1.0f,1.0f),rc);
+							B.morphMaterialBackend.setMorphProgress(progress);
+							mesh1[i].morph(mesh2[i],rc);
+						}
+						foreach(ref cow;objects.bovineInterventions.data) renderCow(cow.position,cow.rotation,cow.frame);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.charmHearts.length){
+					auto material=self.charmHeart.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					foreach(j;0..objects.charmHearts.length){
+						auto position=state.movingObjectReadById!((ref objects,i,scale){
+							auto hitbox=objects.hitbox(i);
+							return 0.5f*(hitbox[1]+hitbox[0])+Vector3f(0.0f,0.0f,0.75f*scale*(hitbox[1].z-hitbox[0].z));
+						},()=>Vector3f.init)(objects.charmHearts[j].target,objects.charmHearts[j].scale);
+						if(isNaN(position.x)) continue;
+						auto frame=objects.charmHearts[j].frame;
+						auto mesh=self.charmHeart.getFrame(frame%self.charmHeart.numFrames);
+						auto scale=1.5f*objects.charmHearts[j].scale*objects.charmHearts[j].creatureScale;
+						position.z+=0.4f*scale;
+						material.backend.setSpriteTransformationScaled(position,scale,rc);
+						mesh.render(rc);
+					}
+				}
+				if(objects.deathCastings.length&&(mode==RenderMode.opaque||!rc.shadowMode)){
+					foreach(i,mat;self.death.obj.materials){
+						auto originalBackend=mat.backend;
+						scope(success) mat.backend=originalBackend;
+						static if(mode==RenderMode.opaque){
+							mat.backend=B.buildingSummonMaterialBackend1;
+							B.buildingSummonMaterialBackend1.bind(mat,rc);
+							scope(success) B.buildingSummonMaterialBackend1.unbind(mat,rc);
+						}else{
+							mat.backend=B.buildingSummonMaterialBackend2;
+							B.buildingSummonMaterialBackend2.bind(mat,rc);
+							scope(success) B.buildingSummonMaterialBackend2.unbind(mat,rc);
+						}
+						void renderDeath(Vector3f position,float facing,DeathStatus status,int frame){
+							if(status!=DeathStatus.emerging) return;
+							auto progress=float(frame)/Death!B.numEmergingFrames;
+							auto thresholdZ=-Death!B.castingGradientSize+(Death!B.height+Death!B.castingGradientSize)*progress;
+							auto mesh=self.death.obj.meshes[0];
+							assert(mesh.length==self.death.obj.materials.length);
+							auto rotation=facingQuaternion(facing);
+							mat.backend.setTransformation(position+Vector3f(0.0f,0.0f,Death!B.hoverHeight),rotation,rc);
+							static if(mode==RenderMode.opaque){
+								B.buildingSummonMaterialBackend1.setThresholdZ(thresholdZ);
+							}else static if(mode==RenderMode.transparent){
+								B.buildingSummonMaterialBackend2.setThresholdZ(thresholdZ,thresholdZ+Death!B.castingGradientSize);
+							}else static assert(0);
+							mesh[i].render(rc);
+						}
+						foreach(ref deathCasting;objects.deathCastings.data) with(deathCasting) renderDeath(death.position,death.facing,death.status,death.frame);
+						//foreach(ref death;objects.deaths) renderDeath(death.position,death.facing,death.status,death.frame);
+					}
+				}
+				static if(mode==RenderMode.opaque) if(objects.deathCastings.length||objects.deaths.length){
+					foreach(i,mat;self.death.obj.materials){
+						B.morphMaterialBackend.bind(mat,rc);
+						scope(success) B.morphMaterialBackend.unbind(mat,rc);
+						void renderDeath(Vector3f position,float facing,DeathStatus status,int frame){
+							if(status==DeathStatus.emerging) return;
+							final switch(status) with(DeathStatus){
+								case emerging: frame=self.death.emergingFrame(frame); break;
+								case spawning: frame=self.death.spawningFrame(frame); break;
+								case casting,walking: frame=self.death.walkingFrame(frame); break;
+								case attacking: frame=self.death.attackingFrame(frame); break;
+								case despawning: frame=self.death.despawningFrame(frame); break;
+							}
+							auto mesh1Mesh2Progress=self.death.getFrame(frame%self.death.numFrames);
+							auto mesh1=mesh1Mesh2Progress[0], mesh2=mesh1Mesh2Progress[1], progress=mesh1Mesh2Progress[2];
+							assert(mesh1.length==mesh2.length&&mesh1.length==self.death.obj.materials.length);
+							auto rotation=facingQuaternion(facing);
+							B.morphMaterialBackend.setTransformation(position+Vector3f(0.0f,0.0f,Death!B.hoverHeight),rotation,rc);
+							B.morphMaterialBackend.setMorphProgress(progress);
+							mesh1[i].morph(mesh2[i],rc);
+						}
+						foreach(ref deathCasting;objects.deathCastings.data) with(deathCasting) renderDeath(death.position,death.facing,death.status,death.frame);
+						foreach(ref death;objects.deaths.data) renderDeath(death.position,death.facing,death.status,death.frame);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.deathCastings.length||objects.deaths.length)){
+					B.disableDepthMask();
+					B.enableCulling();
+					auto material=self.deathAura.material;
+					B.shadelessMorphMaterialBackend.bind(material,rc);
+					B.enableAdditive();
+					scope(success){
+						B.enableDepthMask();
+						B.shadelessMorphMaterialBackend.unbind(material,rc);
+					}
+					void renderDeathAura(ref Death!B death){
+						auto position=death.position+Vector3f(0.0f,0.0f,0.5f*death.height);
+						auto scale=float(death.auraFrame%death.numAuraFrames)/death.numAuraFrames;
+						auto dimensions=Vector3f(2.4f,2.4f,1.9f)*death.height;
+						B.shadelessMorphMaterialBackend.setTransformationScaled(position,Quaternionf.identity(),-scale*dimensions,rc);
+						B.shadelessMorphMaterialBackend.setEnergy(-0.25f/3.0f*(1.0f-scale)^^2);
+						foreach(v;0..3){
+							auto mesh1Mesh2Progress=self.deathAura.getFrame(death.auraFrame+20*v,death.auraFrame);
+							auto mesh1=mesh1Mesh2Progress[0], mesh2=mesh1Mesh2Progress[1], progress=mesh1Mesh2Progress[2];
+							B.shadelessMorphMaterialBackend.setMorphProgress(progress);
+							mesh1.morph(mesh2,rc);
+						}
+					}
+					foreach(ref deathCasting;objects.deathCastings.data) renderDeathAura(deathCasting.death);
+					foreach(ref death;objects.deaths.data) renderDeathAura(death);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.brainiacEffects.length){
+					auto material=self.brainiacEffect.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					foreach(j;0..objects.brainiacEffects.length){
+						auto position=objects.brainiacEffects[j].position;
+						auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),objects.brainiacEffects[j].direction); // TODO: precompute this?
+						auto frame=objects.brainiacEffects[j].frame;
+						auto relativeProgress=float(frame)/self.brainiacEffect.numFrames;
+						auto scale=1.0f+0.6f*relativeProgress^^2.5f;
+						B.shadelessMaterialBackend.setTransformationScaled(position,rotation,scale*Vector3f(1.0f,1.0f,1.0f),rc);
+						B.shadelessMaterialBackend.setAlpha(0.95f*(1.0f-relativeProgress)^^1.5f);
+						auto mesh=self.brainiacEffect.getFrame(objects.brainiacEffects[j].frame%self.brainiacEffect.numFrames);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.shrikeEffects.length)
+				foreach(hydroPass;0..2){
+					auto material=hydroPass?self.hydroMaterial("extracted/charlie/Bloo.WAD!/Pers.FLDR/tex_ZERO_.FLDR/sonc.TXTR",15.0f):self.shrikeEffect.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					foreach(j;0..objects.shrikeEffects.length){
+						if(objects.shrikeEffects[j].hydro!=!!hydroPass) continue;
+						auto position=objects.shrikeEffects[j].position;
+						auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),objects.shrikeEffects[j].direction); // TODO: precompute this?
+						auto frame=objects.shrikeEffects[j].frame;
+						auto relativeProgress=float(frame)/self.shrikeEffect.numFrames;
+						auto scale=(1.0f+0.6f*relativeProgress^^2.5f)*objects.shrikeEffects[j].scale;
+						B.shadelessMaterialBackend.setTransformationScaled(position,rotation,scale*Vector3f(1.0f,1.0f,1.0f),rc);
+						B.shadelessMaterialBackend.setAlpha(0.95f*(1.0f-relativeProgress)^^2.0f);
+						auto mesh=self.shrikeEffect.getFrame(objects.shrikeEffects[j].frame%self.shrikeEffect.numFrames);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.spitfireEffects.length){
+					auto fire=SacParticle!B.get(ParticleType.fire);
+					auto material=fire.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					foreach(j;0..objects.spitfireEffects.length){
+						auto position=objects.spitfireEffects[j].position;
+						auto frame=objects.spitfireEffects[j].frame;
+						auto scale=objects.spitfireEffects[j].scale;
+						material.backend.setSpriteTransformationScaled(position,scale,rc);
+						auto mesh=fire.getMesh(objects.spitfireEffects[j].frame%fire.numFrames);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.gargoyleEffects.length){
+					auto rock=SacParticle!B.get(ParticleType.rock);
+					auto material=rock.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					foreach(j;0..objects.gargoyleEffects.length){
+						auto position=objects.gargoyleEffects[j].position;
+						auto frame=objects.gargoyleEffects[j].frame;
+						auto scale=objects.gargoyleEffects[j].scale;
+						material.backend.setSpriteTransformationScaled(position,scale,rc);
+						auto mesh=rock.getMesh(objects.gargoyleEffects[j].frame%rock.numFrames);
+						mesh.render(rc);
+					}
+				}
+				static foreach(arrow;["sylph","ranger"])
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(mixin(`objects.`~arrow~`Effects`).length||mixin(`objects.`~arrow~`Projectiles`).length)){
+					auto material=mixin(`self.arrow.`~arrow~`Material`);
+					enum arrowPath=arrow=="sylph"?"extracted/main/MAIN.WAD!/bits.FLDR/ltn2.TXTR":"extracted/main/MAIN.WAD!/bits.FLDR/wzrg.TXTR";
+					auto hydroArrow=self.hydroMaterial(arrowPath,arrow=="sylph"?30.0f:45.0f); // Hydro mod: water arrows
+					bool hydroBound=false;
+					void useHydro(bool h){
+						if(h==hydroBound) return;
+						(hydroBound?hydroArrow:material).unbind(rc);
+						(h?hydroArrow:material).bind(rc);
+						hydroBound=h;
+					}
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						(hydroBound?hydroArrow:material).unbind(rc);
+					}
+					foreach(j;0..mixin(`objects.`~arrow~`Effects`).length){
+						auto id=mixin(`objects.`~arrow~`Effects`)[j].attacker;
+						if(!state.isValidTarget(id,TargetType.creature)) continue;
+						static if(arrow=="ranger") if(self.isBoltId(id,state)) continue; // drawn as a water bolt below
+						useHydro(self.isHydroId(id,state));
+						auto mesh=self.arrow.getFrame(mixin(`objects.`~arrow~`Effects`)[j].frame%(16*updateAnimFactor));
+						// static void renderLoadedArrow(B)(ref MovingObject!B object,SacScene scene,Mesh mesh,ObjectState!B state,RenderInfo!B* info,B.RenderContext rc){
+						// 	// implementation moved to outer scope due to compiler bug
+						// }
+						state.movingObjectById!(renderLoadedArrow!B,(){})(id,mesh,state,info,rc);
+					}
+					foreach(j;0..mixin(`objects.`~arrow~`Projectiles`).length){
+						static if(arrow=="ranger") if(self.isBoltId(mixin(`objects.`~arrow~`Projectiles`)[j].attacker,state)) continue; // drawn as a water bolt below
+						useHydro(self.isHydroId(mixin(`objects.`~arrow~`Projectiles`)[j].attacker,state));
+						auto position=mixin(`objects.`~arrow~`Projectiles`)[j].position;
+						auto velocity=mixin(`objects.`~arrow~`Projectiles`)[j].velocity;
+						auto direction=velocity.normalized;
+						auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),direction);
+						B.shadelessMaterialBackend.setTransformationScaled(position,rotation,Vector3f(1.0f,1.0f,1.6f),rc);
+						auto mesh=self.arrow.getFrame(mixin(`objects.`~arrow~`Projectiles`)[j].frame%(16*updateAnimFactor));
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.rangerEffects.length||objects.rangerProjectiles.length)){
+					// Hydro mod: water bolts (Tidecaller, Puffy): a ball of water gathering at the staff
+					// or mouth while the creature takes aim, then flying with a trail of smaller blobs
+					auto material=self.fxMaterial(self.boltMat,"waterbolt.png");
+					if(!self.boltMesh) self.boltMesh=makeSpriteMeshes!B(1,1,1.0f,1.0f)[0];
+					bool bound=false;
+					void bind(){ if(!bound){ material.bind(rc); bound=true; } }
+					scope(success) if(bound) material.unbind(rc);
+					foreach(j;0..objects.rangerEffects.length){
+						auto id=objects.rangerEffects[j].attacker;
+						if(!state.isValidTarget(id,TargetType.creature)||!self.isBoltId(id,state)) continue;
+						bind();
+						auto frame=objects.rangerEffects[j].frame;
+						auto grow=min(1.0f,frame/(0.5f*updateFPS));
+						auto pos=state.movingObjectById!((ref o)=>o.shotPosition,()=>Vector3f.init)(id);
+						if(pos.x!=pos.x) continue;
+						auto pulse=1.0f+0.12f*sin(frame*0.5f);
+						B.shadelessMaterialBackend.setSpriteTransformationScaled(pos,0.25f+0.55f*grow*pulse,rc);
+						B.shadelessMaterialBackend.setAlpha(0.4f+0.6f*grow);
+						self.boltMesh.render(rc);
+					}
+					foreach(j;0..objects.rangerProjectiles.length){
+						auto p=&objects.rangerProjectiles[j];
+						if(!self.isBoltId(p.attacker,state)) continue;
+						bind();
+						auto dir=p.velocity.normalized;
+						foreach(k;0..5){ // the ball, then its trail
+							auto pos=p.position-dir*(0.45f*k);
+							B.shadelessMaterialBackend.setSpriteTransformationScaled(pos,(k==0?0.85f:0.6f-0.1f*k)*(1.0f+0.1f*sin(p.frame*0.7f+k)),rc);
+							B.shadelessMaterialBackend.setAlpha(k==0?1.0f:0.55f-0.1f*k);
+							self.boltMesh.render(rc);
+						}
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.basiliskEffects.length){
+					auto material=self.basiliskEffect.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					foreach(j;0..objects.basiliskEffects.length){
+						auto position=objects.basiliskEffects[j].position;
+						auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),objects.basiliskEffects[j].direction); // TODO: precompute this?
+						auto frame=objects.basiliskEffects[j].frame;
+						auto relativeProgress=float(frame)/self.basiliskEffect.numFrames;
+						auto scale=1.0f+0.6f*relativeProgress^^2.5f;
+						B.shadelessMaterialBackend.setTransformationScaled(position,rotation,scale*Vector3f(1.0f,1.0f,1.0f),rc);
+						B.shadelessMaterialBackend.setAlpha(0.95f*(1.0f-relativeProgress)^^1.5f);
+						auto mesh=self.basiliskEffect.getFrame(objects.basiliskEffects[j].frame%self.basiliskEffect.numFrames);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.tickfernoProjectiles.length||objects.phoenixProjectiles.length)){
+					auto material=self.laser.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					void renderLaser(float scale,int frame,Vector3f start,Vector3f end){
+						auto diff=end-start;
+						auto len=diff.length;
+						auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),diff/len);
+						//auto pulse=0.75f+0.25f*0.5f*(1.0f+sin(2.0f*pi!float*(frame%pulseFrames)/(pulseFrames-1)));
+						B.shadelessBoneMaterialBackend.setTransformationScaled(start,rotation,Vector3f(scale,scale,len),rc);
+						auto mesh=self.laser.getFrame(frame%self.laser.numFrames);
+						Matrix4x4f[self.laser.numSegments+1] pose;
+						pose[0]=pose[self.laser.numSegments]=Matrix4f.identity();
+						foreach(i,ref x;pose[1..$-1]){
+							auto curve=Vector3f(0.0f,0.0f,0.0f);
+							if(i+1==pose[1..$-1].length) curve.z=(1.0f/3.0f)*max(0.0f,1.0f-2.0f/len);
+							x=Transformation(Quaternionf.identity(),curve).getMatrix4f;
+						}
+						B.shadelessBoneMaterialBackend.setPose(pose);
+						mesh.render(rc);
+					}
+					foreach(ref projectile;objects.tickfernoProjectiles.data) renderLaser(2.0f/3.0f,projectile.frame,projectile.startPosition,projectile.position);
+					foreach(ref projectile;objects.phoenixProjectiles.data) renderLaser(2.0f/3.0f,projectile.frame,projectile.startPosition,projectile.position);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.magnifryers.length){
+					auto material=self.magnifryerBeam.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					foreach(ref magnifryer;objects.magnifryers.data){
+						if(magnifryer.beamFade==0.0f) continue;
+						auto start=state.buildingById!((ref building,gun,state)=>magnifryerMuzzle(gun,building,state),()=>Vector3f.init)(magnifryer.building,magnifryer.gun,state);
+						if(isNaN(start.x)) continue;
+						auto end=magnifryer.beamEnd;
+						auto diff=end-start;
+						auto len=diff.length;
+						if(len==0.0f) continue;
+						auto dir=diff/len;
+						auto up=dir.z<0.99f&&dir.z>-0.99f?Vector3f(0.0f,0.0f,1.0f):Vector3f(1.0f,0.0f,0.0f);
+						auto p2=cross(dir,up).normalized;
+						auto p1=cross(p2,dir);
+						auto rotation=Quaternionf.fromMatrix(Matrix4x4f([
+							p2.x,p2.y,p2.z,0.0f,
+							-p1.x,-p1.y,-p1.z,0.0f,
+							dir.x,dir.y,dir.z,0.0f,
+							0.0f,0.0f,0.0f,1.0f]));
+						auto width=3.0f*magnifryer.beamFade;
+						B.shadelessBoneMaterialBackend.setTransformationScaled(start,rotation,Vector3f(width,width,len),rc);
+						auto mesh=self.magnifryerBeam.getFrame(cast(int)(magnifryer.beamPhase*self.magnifryerBeam.numFrames));
+						Matrix4x4f[self.magnifryerBeam.numSegments+1] pose;
+						pose[]=Matrix4f.identity();
+						pose[0]=scaleMatrix(Vector3f(0.25f,0.25f,1.0f));
+						pose[$-1]=pose[0];
+						B.shadelessBoneMaterialBackend.setPose(pose);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.tickfernoEffects.length||objects.vortickEffects.length||objects.phoenixEffects.length)){
+					auto material=self.tube.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					void renderTube(Vector3f position,Vector3f direction,int frame,float scale_,float ltfactor=1.0f){
+						auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),direction); // TODO: precompute this?
+						auto relativeProgress=float(frame)/(ltfactor*self.tube.numFrames);
+						auto scale=scale_*(1.0f+0.6f*relativeProgress^^2.5f);
+						B.shadelessMaterialBackend.setTransformationScaled(position,rotation,scale*Vector3f(1.0f,1.0f,1.0f),rc);
+						B.shadelessMaterialBackend.setAlpha(0.95f*(1.0f-relativeProgress)^^1.5f);
+						auto mesh=self.tube.getFrame(frame%self.tube.numFrames);
+						mesh.render(rc);
+					}
+					foreach(ref effect;objects.tickfernoEffects.data) renderTube(effect.position,effect.direction,effect.frame,1.2f,2.0f);
+					foreach(ref effect;objects.vortickEffects.data) renderTube(effect.position,effect.direction,effect.frame,0.6f,2.0f);
+					foreach(ref effect;objects.phoenixEffects.data) renderTube(effect.position,effect.direction,effect.frame,1.2f,2.0f);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.vortexEffects.length){
+					auto material=self.vortexEffect.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					foreach(ref effect;objects.vortexEffects.data){
+						if(effect.hydroMaelstrom||effect.hydroBig) continue; // drawn below
+						foreach(ref particle;effect.particles.data){
+							auto position=particle.position;
+							auto frame=particle.frame;
+							auto scale=(0.6f+0.4f*frame/(effect.duration*updateFPS)*particle.scale);
+							B.shadelessMaterialBackend.setSpriteTransformationScaled(effect.position+position,scale,rc);
+							auto alpha=(1.0f-1.0f*effect.frame/(effect.duration*updateFPS))^^2;
+							B.shadelessMaterialBackend.setAlpha(alpha);
+							auto mesh=self.vortexEffect.getFrame(frame%self.vortexEffect.numFrames);
+							mesh.render(rc);
+						}
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.vortexEffects.length){ // Hydro mod: the Leviathan's whirlpool
+					foreach(ref effect;objects.vortexEffects.data){
+						if(!effect.hydroMaelstrom&&!effect.hydroSpring) continue;
+						auto total=effect.duration*updateFPS;
+						auto fade=min(1.0f,effect.frame/(0.6f*updateFPS),(total-effect.frame)/(1.2f*updateFPS));
+						if(fade<=0.0f) continue;
+						auto radius=effect.rangedAttack.effectRange;
+						self.prepareWhirlpool(effect.position,radius*min(1.0f,0.4f+effect.frame/(1.0f*updateFPS)),effect.spin,state);
+						auto disc=effect.hydroUndertow?self.fxMaterial(self.undertowMat,"undertow.png"):effect.hydroSpring?self.fxMaterial(self.springMat,"spring.png"):self.whirlMaterial; // Undertow: murky water and algae; Healing Spring: clear glowing water
+						disc.bind(rc);
+						B.disableCulling();
+						B.shadelessMaterialBackend.setTransformationScaled(effect.position,Quaternionf.identity(),Vector3f(1.0f,1.0f,1.0f),rc);
+						B.shadelessMaterialBackend.setAlpha(0.9f*fade);
+						self.whirlMesh.render(rc);
+						B.enableCulling();
+						disc.unbind(rc);
+						if(effect.hydroSpring) continue; // its fountain and lights are ordinary particles
+						auto foam=SacParticle!B.get(ParticleType.hydroFoam);
+						if(effect.hydroUndertow){ // seaweed: strands around the target swaying, and torn bits drifting in the swirl
+							auto algae=self.fxMaterial(self.algaeMat,"algae.png");
+							if(!self.algaeMesh) self.algaeMesh=makeSpriteMeshes!B(1,1,1.6f,1.6f)[0]; // one picture, not a 4x4 sheet like the foam
+							algae.bind(rc);
+							foreach(ref particle;effect.particles.data){
+								auto frame=particle.frame;
+								if(particle.kelp){
+									if(frame<0) continue;
+									auto grow=min(1.0f,frame/(0.5f*updateFPS));
+									auto sway=0.15f*sin(2.0f*pi!float*1.2f*frame/updateFPS+particle.velocity.y);
+									auto p=particle.position; p.x+=sway*cos(particle.velocity.x+1.5f); p.y+=sway*sin(particle.velocity.x+1.5f); p.z*=grow;
+									B.shadelessMaterialBackend.setSpriteTransformationScaled(effect.position+p,0.85f*particle.scale*grow,rc);
+									B.shadelessMaterialBackend.setAlpha(fade);
+								}else{
+									B.shadelessMaterialBackend.setSpriteTransformationScaled(effect.position+particle.position,0.45f*particle.scale,rc);
+									B.shadelessMaterialBackend.setAlpha(0.8f*fade*min(1.0f,(3*updateFPS-frame)/(0.5f*updateFPS)));
+								}
+								self.algaeMesh.render(rc);
+							}
+							algae.unbind(rc);
+							continue;
+						}
+						foam.material.bind(rc);
+						foreach(ref particle;effect.particles.data){
+							auto frame=particle.frame;
+							B.shadelessMaterialBackend.setSpriteTransformationScaled(effect.position+particle.position,0.8f*particle.scale,rc);
+							B.shadelessMaterialBackend.setAlpha(0.5f*fade*min(1.0f,(3*updateFPS-frame)/(0.5f*updateFPS)));
+							foam.getMesh(frame%foam.numFrames).render(rc);
+						}
+						foam.material.unbind(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.vortexEffects.length){ // Hydro mod: Acid Rain, Tsunami, Kraken
+					foreach(ref effect;objects.vortexEffects.data) if(effect.hydroBig) self.renderHydroBig(effect,state,rc);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.meanstalkss.length){ // Hydro mod: the Kraken's tentacles
+					bool anyKraken=false;
+					foreach(ref meanstalks;objects.meanstalkss.data) anyKraken|=meanstalks.hydro;
+					if(anyKraken){
+						auto tmat=self.tentacleMaterial();
+						tmat.bind(rc);
+						B.disableCulling();
+						foreach(ref meanstalks;objects.meanstalkss.data){
+							if(!meanstalks.hydro) continue;
+							foreach(ref vine;meanstalks.vines[0..meanstalks.numVines]){
+								self.prepareTentacle(vine,meanstalks.hydroScale);
+								B.shadelessMaterialBackend.setTransformationScaled(Vector3f(0.0f,0.0f,0.0f),Quaternionf.identity(),Vector3f(1.0f,1.0f,1.0f),rc);
+								B.shadelessMaterialBackend.setAlpha(1.0f);
+								self.tentacleMesh.render(rc);
+							}
+						}
+						B.enableCulling();
+						tmat.unbind(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.erupts.length){ // Hydro mod: the Geyser's dome
+					foreach(ref erupt;objects.erupts.data){
+						if(erupt.hydroKind!=1||erupt.frame>=geyserBurstFrame) continue;
+						self.prepareDome(erupt,state);
+						auto mat=self.fxMaterial(self.domeMat,"dome.png");
+						mat.bind(rc);
+						B.disableCulling();
+						B.shadelessMaterialBackend.setTransformationScaled(erupt.position,Quaternionf.identity(),Vector3f(1.0f,1.0f,1.0f),rc);
+						B.shadelessMaterialBackend.setAlpha(min(1.0f,erupt.frame/(0.3f*updateFPS)));
+						self.domeMesh.render(rc);
+						B.enableCulling();
+						mat.unbind(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.squallEffects.length){
+					auto material=self.squallEffect.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					void renderSquallEffect(Vector3f position,Vector3f direction,int frame,float scale_,float ltfactor=1.0f){
+						auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),direction); // TODO: precompute this?
+						auto relativeProgress=float(frame)/(ltfactor*self.squallEffect.numFrames);
+						auto scale=scale_*(1.0f+1.0f*relativeProgress^^2.5f);
+						B.shadelessMaterialBackend.setTransformationScaled(position,rotation,scale*Vector3f(1.0f,1.0f,1.0f),rc);
+						B.shadelessMaterialBackend.setAlpha(0.95f*(1.0f-relativeProgress)^^1.5f);
+						auto mesh=self.squallEffect.getFrame(frame%self.squallEffect.numFrames);
+						mesh.render(rc);
+					}
+					foreach(ref effect;objects.squallEffects.data) renderSquallEffect(effect.position,effect.direction,effect.frame,0.6f,2.0f);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.pyromaniacRockets.length){
+					auto material=self.pyromaniacRocket.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					void renderPyromaniacRocket(Vector3f position,Vector3f direction,int frame){
+						auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),direction); // TODO: precompute this?
+						B.shadelessMaterialBackend.setTransformation(position,rotation,rc);
+						auto mesh=self.pyromaniacRocket.getFrame(frame%self.pyromaniacRocket.numFrames);
+						mesh.render(rc);
+					}
+					foreach(ref effect;objects.pyromaniacRockets.data) renderPyromaniacRocket(effect.position,effect.direction,effect.frame);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.gnomeEffects.length){
+					auto material=self.gnomeEffect.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					void renderGnomeEffect(Vector3f position,Vector3f direction,int frame){
+						auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),direction); // TODO: precompute this?
+						B.shadelessMaterialBackend.setTransformation(position,rotation,rc);
+						auto mesh=self.gnomeEffect.getFrame(frame%self.gnomeEffect.numFrames);
+						mesh.render(rc);
+					}
+					foreach(ref effect;objects.gnomeEffects.data) renderGnomeEffect(effect.position,effect.direction,effect.frame);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.warmongerGuns.length){
+					auto material=self.warmongerEffect.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					void renderWarmongerEffect(Vector3f position,Vector3f direction,int frame){
+						auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),direction); // TODO: precompute this?
+						B.shadelessMaterialBackend.setTransformation(position,rotation,rc);
+						auto mesh=self.warmongerEffect.getFrame(frame%self.warmongerEffect.numFrames);
+						mesh.render(rc);
+					}
+					foreach(ref effect;objects.warmongerGuns.data) renderWarmongerEffect(effect.position,effect.direction,effect.frame);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.poisonDarts.length){
+					auto material=self.poisonDart.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					void renderPoisonDart(Vector3f position,Vector3f direction){
+						auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),direction); // TODO: precompute this?
+						B.shadelessMaterialBackend.setTransformation(position,rotation,rc);
+						auto mesh=self.poisonDart.mesh;
+						mesh.render(rc);
+					}
+					foreach(ref effect;objects.poisonDarts.data) renderPoisonDart(effect.position,effect.direction);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.mutantProjectiles.length){
+					auto material=self.mutantProjectile.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					foreach(j;0..objects.mutantProjectiles.length){
+						auto position=objects.mutantProjectiles[j].position;
+						auto frame=objects.mutantProjectiles[j].frame;
+						auto mesh=self.mutantProjectile.getFrame(frame%self.mutantProjectile.numFrames);
+						material.backend.setSpriteTransformation(position,rc);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.abominationProjectiles.length){
+					auto material=self.abominationProjectile.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					foreach(j;0..objects.abominationProjectiles.length){
+						auto position=objects.abominationProjectiles[j].position;
+						auto frame=objects.abominationProjectiles[j].frame;
+						auto mesh=self.abominationProjectile.getFrame(frame%self.abominationProjectile.numFrames);
+						material.backend.setSpriteTransformation(position,rc);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.abominationDroplets.length){
+					auto sacParticle=SacParticle!B.get(ParticleType.blood);
+					auto frame=10; // TODO: ok?
+					auto material=sacParticle.material;
+					material.bind(rc);
+					B.shadelessMaterialBackend.setEnergy(10.0f);
+					scope(success) material.unbind(rc);
+					auto mesh=sacParticle.getMesh(frame);
+					foreach(j;0..objects.abominationDroplets.length){
+						auto position=objects.abominationDroplets[j].position;
+						material.backend.setSpriteTransformation(position,rc);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.bombardProjectiles.length||objects.rainOfFireDrops.length)){
+					auto material=self.bombardProjectile.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					foreach(j;0..objects.bombardProjectiles.length){
+						if(self.isHydroId(objects.bombardProjectiles[j].attacker,state)) continue; // drawn below
+						auto position=objects.bombardProjectiles[j].position;
+						auto frame=objects.bombardProjectiles[j].frame;
+						auto mesh=self.bombardProjectile.getFrame(frame%self.bombardProjectile.numFrames);
+						material.backend.setSpriteTransformation(position,rc);
+						mesh.render(rc);
+					}
+					{ // Hydro mod: the Reefbreaker's coral mortar, sea-blue
+						auto hmat=self.hydroMaterial("extracted/charlie/Bloo.WAD!/Pyro.FLDR/txtr.FLDR/bbrd.TXTR",20.0f);
+						bool bound=false;
+						foreach(j;0..objects.bombardProjectiles.length){
+							if(!self.isHydroId(objects.bombardProjectiles[j].attacker,state)) continue;
+							if(!bound){ material.unbind(rc); hmat.bind(rc); bound=true; }
+							auto position=objects.bombardProjectiles[j].position;
+							auto frame=objects.bombardProjectiles[j].frame;
+							auto mesh=self.bombardProjectile.getFrame(frame%self.bombardProjectile.numFrames);
+							hmat.backend.setSpriteTransformation(position,rc);
+							mesh.render(rc);
+						}
+						if(bound){ hmat.unbind(rc); material.bind(rc); }
+					}
+					foreach(j;0..objects.rainOfFireDrops.length){
+						auto position=objects.rainOfFireDrops[j].position;
+						auto frame=objects.rainOfFireDrops[j].frame;
+						auto mesh=self.bombardProjectile.getFrame(frame%self.bombardProjectile.numFrames);
+						material.backend.setSpriteTransformationScaled(position,2.5f,rc);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.flurryProjectiles.length){
+					auto material=self.flurryProjectile.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					foreach(j;0..objects.flurryProjectiles.length){
+						auto position=objects.flurryProjectiles[j].position;
+						auto rotation=objects.flurryProjectiles[j].rotation;
+						auto mesh=self.flurryProjectile.mesh;
+						material.backend.setTransformation(position,rotation,rc);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.flurryImplosions.length){
+					auto material=self.flurryImplosion.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					foreach(j;0..objects.flurryImplosions.length){
+						auto position=objects.flurryImplosions[j].position;
+						auto scale=objects.flurryImplosions[j].scale*Vector3f(1.1f,1.1f,0.9f);
+						auto mesh=self.flurryImplosion.mesh;
+						material.backend.setTransformationScaled(position,Quaternionf.identity(),scale,rc);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(
+					                                           objects.frozenGroundCastings.length||
+					                                           objects.frozenGroundSnowballs.length
+				                                           )
+				){
+					B.disableDepthMask();
+					B.enableCulling();
+					scope(success){
+						B.enableDepthMask();
+					}
+					auto materials=self.snowball.materials;
+					foreach(i,mat;materials){
+						B.shadelessMaterialBackend.bind(mat,rc);
+						B.enableAdditive();
+						B.shadelessMaterialBackend.setEnergy(10.0f);
+						scope(success) B.shadelessMaterialBackend.unbind(mat,rc);
+						auto mesh=self.snowball.meshes[0][i];
+						void renderSnowball(ref FrozenGroundSnowball!B snowball,float scale){
+							B.shadelessMaterialBackend.setTransformationScaled(snowball.position,snowball.rotation,scale*Vector3f(1.0f,1.0f,1.0f),rc);
+							mesh.render(rc);
+						}
+						foreach(ref frozenGroundCasting;objects.frozenGroundCastings.data){
+							auto scale=frozenGroundCasting.scale;
+							renderSnowball(frozenGroundCasting.snowball,scale);
+						}
+						foreach(ref frozenGroundSnowball;objects.frozenGroundSnowballs.data){
+							renderSnowball(frozenGroundSnowball,1.0f);
+						}
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.frozenGrounds.length){
+					auto mat=self.frozenGround.material;
+					mat.bind(rc);
+					mat.backend.setTransformation(Vector3f(0.0f,0.0f,0.0f),Quaternionf.identity(),rc); // TODO: don't create rotation matrix
+					scope(success) mat.unbind(rc);
+					auto mesh=self.frozenGround.mesh;
+					foreach(ref frozenGround;objects.frozenGrounds.data){
+						auto maxRadius=frozenGround.maxRadius;
+						auto minRadius=frozenGround.minRadius;
+						auto curRadius=frozenGround.curRadius;
+						mesh.prepare(frozenGround.center,minRadius,curRadius,maxRadius,state,0.5f);
+						mesh.render(rc);
+					}
+				}
+				}else{
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.volcanos.length){
+					foreach(ref volcano;objects.volcanos.data){
+						if(volcano.frame<volcano.volcanoFrame) continue;
+						auto eruptFrame=volcano.frame-volcano.volcanoFrame;
+						auto remaining=(volcano.progress-Volcano!B.residual)/(1.0f-Volcano!B.residual)*volcano.spell.duration*updateFPS;
+						auto position=Vector3f(volcano.position.x,volcano.position.y,0.0f);
+						position.z=state.getHeight(position);
+						{
+							auto mat=self.volcanoLava.material;
+							mat.bind(rc);
+							scope(success) mat.unbind(rc);
+							auto mesh=self.volcanoLava.getFrame(eruptFrame,remaining);
+							mat.backend.setTransformation(position,Quaternionf.identity(),rc);
+							mesh.render(rc);
+						}
+						{
+							auto alpha=min(1.0f,1.1f*eruptFrame/self.volcanoLava.numExtendFrames)*min(1.0f,max(0.0f,remaining)/updateFPS);
+							auto mat=self.volcanoCloud.material;
+							mat.bind(rc);
+							scope(success) mat.unbind(rc);
+							mat.backend.setAlpha(alpha);
+							auto mesh=self.volcanoCloud.getFrame(eruptFrame);
+							mat.backend.setTransformation(position,Quaternionf.identity(),rc);
+							mesh.render(rc);
+						}
+						{
+							auto mat=self.volcanoSpatter.material;
+							mat.bind(rc);
+							B.disableCulling();
+							scope(success){
+								B.enableCulling();
+								mat.unbind(rc);
+							}
+							mat.backend.setTransformation(position,Quaternionf.identity(),rc);
+							auto mesh=self.volcanoSpatter.prepare(position,eruptFrame,state);
+							mesh.render(rc);
+						}
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.tornadoCastings.length||objects.tornados.length)){
+					void renderTornado(ref Tornado!B tornado){
+						auto alpha=sqrt(sqrt(min(1.0f,1.5f*tornado.scale)));
+						auto home=tornado.home;
+						auto depth=-(Vector4f(home.x,home.y,home.z,1.0f)*rc.viewMatrix).z;
+						auto lod=depth<=10.0f?1.0f:cast(float)min(1.0,0.5^^(cast(double)(depth-10.0f)/10.0));
+						enum numSegments=128,numRings=128;
+						auto camRight=rotate(facingQuaternion(-degtorad(info.camera.turn)),Vector3f(1.0f,0.0f,0.0f));
+						self.tornado.prepare(tornado.axisPoints,tornado.radii,tornado.spinPhase,numSegments,numRings,cast(int)tornado.animPhase,info.camera.position,Vector2f(camRight.x,camRight.y),tornado.size!=1.0f?Vector3f(0.35f,0.7f,1.0f):Vector3f(1.0f,1.0f,1.0f));
+						void renderPart(ref B.Material mat,B.Mesh mesh){
+							mat.bind(rc);
+							B.disableCulling();
+							scope(exit){
+								B.enableCulling();
+								mat.unbind(rc);
+							}
+							mat.backend.setAlpha(alpha);
+							mat.backend.setTransformation(tornado.top,Quaternionf.identity(),rc);
+							mesh.render(rc);
+						}
+						renderPart(self.tornado.material,self.tornado.mesh);
+						renderPart(self.tornado.material3,self.tornado.mesh3);
+						renderPart(self.tornado.material2,self.tornado.mesh2);
+					}
+					foreach(ref tornadoCasting;objects.tornadoCastings.data)
+						renderTornado(tornadoCasting.tornado);
+					foreach(ref tornado;objects.tornados.data)
+						renderTornado(tornado);
+				}
+				} // onlyOpaqueEffects
+				if(!onlyOpaqueEffects){
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.silverbackEffects.length){
+					auto cold=SacParticle!B.get(ParticleType.cold);
+					auto material=cold.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					foreach(j;0..objects.silverbackEffects.length){
+						if(objects.silverbackEffects[j].hydro) continue; // Hydro mod: drawn as water below
+						auto position=objects.silverbackEffects[j].position;
+						auto frame=objects.silverbackEffects[j].frame;
+						auto scale=objects.silverbackEffects[j].scale;
+						material.backend.setSpriteTransformationScaled(position,scale,rc);
+						auto mesh=cold.getMesh(objects.silverbackEffects[j].frame%cold.numFrames);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.silverbackEffects.length){ // Hydro mod: the Leviathan's water jet
+					auto foam=SacParticle!B.get(ParticleType.hydroFoam);
+					foam.material.bind(rc);
+					scope(success) foam.material.unbind(rc);
+					foreach(j;0..objects.silverbackEffects.length){
+						if(!objects.silverbackEffects[j].hydro) continue;
+						B.shadelessMaterialBackend.setSpriteTransformationScaled(objects.silverbackEffects[j].position,0.45f*objects.silverbackEffects[j].scale,rc);
+						B.shadelessMaterialBackend.setAlpha(max(0.0f,1.0f-objects.silverbackEffects[j].frame/40.0f));
+						foam.getMesh(objects.silverbackEffects[j].frame%foam.numFrames).render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.lifeShields.length){
+					auto material=self.lifeShield.material;
+					material.bind(rc);
+					B.disableCulling();
+					scope(success){
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					auto hydroShield=self.hydroMaterial("extracted/charlie/Bloo.WAD!/Pers.FLDR/tex_ZERO_.FLDR/ent1.TXTR",10.0f);
+					foreach(j;0..objects.lifeShields.length){
+						auto target=objects.lifeShields[j].target;
+						bool hydroTarget=self.isHydroId(target,state); // Hydro mod: Bubble Shield, sea-blue
+						if(hydroTarget){ material.unbind(rc); hydroShield.bind(rc); }
+						scope(exit) if(hydroTarget){ hydroShield.unbind(rc); material.bind(rc); }
+						auto positionRotationBoxSize=state.movingObjectReadById!((ref objects,i)=>tuple(objects.center(i),objects.rotations[i],boxSize(objects.sacObject.largeHitbox(Quaternionf.identity(),objects.scales[i],objects.animationStates[i],objects.frames[i]/updateAnimFactor))), function Tuple!(Vector3f,Quaternionf,Vector3f)(){ return typeof(return).init; })(target);
+						auto position=positionRotationBoxSize[0], rotation=positionRotationBoxSize[1], boxSize=positionRotationBoxSize[2];
+						if(isNaN(position.x)) continue;
+						auto scale=objects.lifeShields[j].scale;
+						(hydroTarget?hydroShield:material).backend.setTransformationScaled(position,rotation,scale*1.4f*boxSize,rc);
+						auto mesh=self.lifeShield.getFrame(objects.lifeShields[j].frame%self.lifeShield.numFrames);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.divineSights.length){
+					auto material=self.divineSight.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					foreach(j;0..objects.divineSights.length){
+						auto position=objects.divineSights[j].position;
+						auto frame=objects.divineSights[j].frame;
+						auto mesh=self.divineSight.getFrame(frame%self.divineSight.numFrames);
+						auto scale=objects.divineSights[j].scale;
+						auto alpha=scale^^2;
+						material.backend.setSpriteTransformationScaled(position,scale,rc);
+						material.backend.setAlpha(alpha);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.blightMites.length){
+					auto material=self.blightMite.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					foreach(j;0..objects.blightMites.length){
+						auto position=objects.blightMites[j].position;
+						if(auto target=objects.blightMites[j].target){
+							auto targetPositionTargetRotation=state.movingObjectReadById!((ref objects,i)=>tuple(objects.positions[i],objects.rotations[i]),()=>Tuple!(Vector3f,Quaternionf).init)(target);
+							auto targetPosition=targetPositionTargetRotation[0], targetRotation=targetPositionTargetRotation[1];
+							position=targetPosition+rotate(targetRotation,position);
+						}
+						auto frame=objects.blightMites[j].frame;
+						auto mesh=self.blightMite.getFrame(frame%self.blightMite.numFrames);
+						auto alpha=objects.blightMites[j].alpha;
+						material.backend.setSpriteTransformation(position,rc);
+						material.backend.setAlpha(alpha);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(objects.webPulls.length){
+					auto material=self.cord.material;
+					material.bind(rc);
+					auto mesh=self.cord.mesh;
+					void renderCord(Vector3f start,Vector3f end,float scale=1.0f){
+						auto direction=end-start;
+						auto len=direction.length;
+						auto rotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),direction/len);
+						B.shadelessMaterialBackend.setTransformationScaled(start,rotation,Vector3f(scale,scale,len),rc);
+						mesh.render(rc);
+					}
+					foreach(ref webPull;objects.webPulls.data){
+						if(!webPull.target) continue;
+						auto start=state.movingObjectReadById!(.shotPosition,()=>Vector3f.init)(webPull.creature);
+						auto end=state.movingObjectReadById!(.center,()=>Vector3f.init)(webPull.target);
+						if(isNaN(end.x)) continue;
+						auto α=min(1.0f,float(webPull.frame)/webPull.numShootFrames);
+						renderCord(start,(1-α)*start+α*end);
+					}
+					material.unbind(rc);
+					material=self.web.material;
+					material.bind(rc);
+					mesh=self.web.mesh;
+					void renderWeb(int target,float scale){
+						if(!target) return;
+						auto positionRotationBoxSize=state.movingObjectReadById!((ref objects,i)=>tuple(objects.center(i),objects.rotations[i],boxSize(objects.sacObject.largeHitbox(Quaternionf.identity(),objects.scales[i],objects.animationStates[i],objects.frames[i]/updateAnimFactor))), function Tuple!(Vector3f,Quaternionf,Vector3f)(){ return typeof(return).init; })(target);
+						auto position=positionRotationBoxSize[0], rotation=positionRotationBoxSize[1], boxSize=positionRotationBoxSize[2];
+						if(isNaN(position.x)) return;
+						material.backend.setTransformationScaled(position,rotation,scale*1.4f*boxSize,rc);
+						mesh.render(rc);
+					}
+					foreach(ref webPull;objects.webPulls.data){
+						auto scale=max(0.0f,min(1.0f,float(webPull.frame-webPull.numShootFrames)/webPull.numGrowFrames));
+						renderWeb(webPull.target,scale);
+					}
+					material.unbind(rc);
+				}
+				static if(mode==RenderMode.transparent) if(objects.cagePulls.length){
+					auto material=self.cage.material;
+					material.bind(rc);
+					void renderCage(int target,int frame,float scale){
+						if(!target) return;
+						auto positionRotationBoxSize=state.movingObjectReadById!((ref objects,i)=>tuple(objects.center(i),objects.rotations[i],boxSize(objects.sacObject.largeHitbox(Quaternionf.identity(),objects.scales[i],objects.animationStates[i],objects.frames[i]/updateAnimFactor))), function Tuple!(Vector3f,Quaternionf,Vector3f)(){ return typeof(return).init; })(target);
+						auto position=positionRotationBoxSize[0], rotation=positionRotationBoxSize[1], boxSize=positionRotationBoxSize[2];
+						if(isNaN(position.x)) return;
+						material.backend.setTransformationScaled(position,rotation,scale*1.4f*boxSize,rc);
+						auto mesh=self.cage.getFrame(frame%self.cage.numFrames);
+						mesh.render(rc);
+					}
+					foreach(ref cagePull;objects.cagePulls.data){
+						auto scale=max(0.0f,min(1.0f,float(cagePull.frame-cagePull.numShootFrames)/cagePull.numGrowFrames));
+						renderCage(cagePull.target,cagePull.frame,scale);
+					}
+					material.unbind(rc);
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&objects.stickyBombs.length){
+					auto material=self.stickyBomb.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					foreach(j;0..objects.stickyBombs.length){
+						auto position=objects.stickyBombs[j].position;
+						if(auto target=objects.stickyBombs[j].target){
+							auto targetPositionTargetRotation=state.movingObjectReadById!((ref objects,i)=>tuple(objects.positions[i],objects.rotations[i]),()=>Tuple!(Vector3f,Quaternionf).init)(target);
+							auto targetPosition=targetPositionTargetRotation[0], targetRotation=targetPositionTargetRotation[1];
+							position=targetPosition+rotate(targetRotation,position);
+						}
+						auto frame=objects.stickyBombs[j].frame;
+						auto mesh=self.stickyBomb.getFrame(frame%self.stickyBomb.numFrames);
+						auto scale=objects.stickyBombs[j].scale;
+						material.backend.setSpriteTransformationScaled(position,scale*Vector3f(1.0f,1.0f,1.0f),rc);
+						mesh.render(rc);
+					}
+				}
+				static if(mode==RenderMode.transparent) if(!rc.shadowMode&&(objects.oilProjectiles.length||objects.oils.length)){
+					auto material=self.oil.material;
+					material.bind(rc);
+					scope(success) material.unbind(rc);
+					foreach(j;0..objects.oilProjectiles.length){
+						auto position=objects.oilProjectiles[j].position;
+						auto frame=objects.oilProjectiles[j].frame;
+						auto mesh=self.oil.getFrame(frame%self.oil.numFrames);
+						//auto scale=objects.oilProjectiles[j].scale;
+						//material.backend.setSpriteTransformationScaled(position,scale*Vector3f(1.0f,1.0f,1.0f),rc);
+						material.backend.setSpriteTransformation(position,rc);
+						mesh.render(rc);
+					}
+					foreach(j;0..objects.oils.length){
+						import std.random:MinstdRand0,uniform;
+						auto rng=MinstdRand0(1);
+						auto creature=objects.oils[j].creature;
+						auto alpha=objects.oils[j].alpha;
+						auto frame=objects.oils[j].frame;
+						auto hitboxScale=state.movingObjectReadById!((ref objects,i)=>tuple(objects.hitbox(i),objects.getScale(i).length),()=>Tuple!(Vector3f[2],float).init)(creature);
+						auto hitbox=hitboxScale[0], scale=hitboxScale[1];
+						if(isNaN(hitbox[0].x)) continue;
+						enum numParticles=10;
+						foreach(_;0..numParticles){
+							Vector3f position;
+							foreach(i,ref x;position) x=uniform(hitbox[0][i],hitbox[1][i],rng);
+							auto mesh=self.oil.getFrame((frame+uniform(0,self.oil.numFrames-1,rng))%self.oil.numFrames);
+							material.backend.setSpriteTransformationScaled(position,0.5f*scale*Vector3f(1.0f,1.0f,1.0f),rc);
+							material.backend.setAlpha(alpha);
+							mesh.render(rc);
+						}
+					}
+				}
+				} // onlyVolcano
+			}else static if(is(T==Particles!(B,kind,sideFiltered),ParticleKind kind,bool sideFiltered)){
+				static if(mode==RenderMode.transparent){
+					if(rc.shadowMode) return; // TODO: particle shadows?
+					auto sacParticle=objects.sacParticle;
+					if(!sacParticle) return; // TODO: get rid of this?
+					auto material=sacParticle.material;
+					material.bind(rc);
+					material.backend.setInformation(Vector4f(0.0f,0.0f,0.0f,0.0f));
+					scope(success) material.unbind(rc);
+					foreach(j;0..objects.length){
+						static if(sideFiltered){
+							if(objects.sideFilters[j]!=info.renderSide)
+								continue;
+						}
+						auto mesh=sacParticle.getMesh(objects.frames[j]); // TODO: do in shader?
+						static if(kind==ParticleKind.relative){
+							auto position=objects.rotates[j]?state.movingObjectReadById!((ref objects,i,particlePosition)=>rotate(objects.rotations[i],particlePosition)+objects.positions[i],()=>Vector3f(0.0f,0.0f,0.0f))(objects.baseIds[j],objects.positions[j])
+								: objects.positions[j]+state.movingObjectReadById!((ref objects,i)=>objects.positions[i],()=>Vector3f(0.0f,0.0f,0.0f))(objects.baseIds[j]);
+						}else static if(kind==ParticleKind.relativeTwirl){
+							auto basePosition=state.movingObjectReadById!((ref objects,i)=>objects.positions[i],()=>Vector3f(0.0f,0.0f,0.0f))(objects.baseIds[j]);
+							auto relativePosition=objects.positions[j];
+							auto c=cos(objects.angles[j]), s=sin(objects.angles[j]);
+							auto position=basePosition+Vector3f(c*relativePosition.x+s*relativePosition.y,c*relativePosition.y-s*relativePosition.x,relativePosition.z);
+						}else{
+							static assert(kind==ParticleKind.standard);
+							auto position=objects.positions[j];
+						}
+						material.backend.setSpriteTransformationScaled(position,objects.scales[j]*sacParticle.getScale(objects.lifetimes[j]),rc);
+						material.backend.setAlpha(sacParticle.getAlpha(objects.lifetimes[j]));
+						mesh.render(rc);
+					}
+				}
+			}else static if(is(T==CommandCones!B)) with(self){
+				static if(mode==RenderMode.transparent){
+					if(rc.shadowMode) return;
+					if(objects.cones.length<=info.renderSide) return;
+					//if(iota(CommandConeColor.max+1).all!(i=>objects.cones[info.renderSide][i].empty)) return;
+					if(iota(CommandConeColor.max+1).allf(closure!((i,info,objects)=>objects.cones[info.renderSide][i].empty)(info,&objects))) return;
+					sacCommandCone.material.bind(rc);
+					assert(sacCommandCone.material.backend is B.shadelessMaterialBackend);
+					B.shadelessMaterialBackend.setInformation(Vector4f(0.0f,0.0f,0.0f,0.0f));
+					scope(success) sacCommandCone.material.unbind(rc);
+					enum maxLifetime=cast(int)(sacCommandCone.lifetime*updateFPS);
+					foreach(i;0..CommandConeColor.max+1){
+						if(objects.cones[info.renderSide][i].length==0) continue;
+						auto color=sacCommandCone.colors[i];
+						auto energy=0.4f*(3.0f/(color.r+color.g+color.b))^^4;
+						B.shadelessMaterialBackend.setEnergy(energy);
+						B.shadelessMaterialBackend.setColor(color);
+						foreach(j;0..objects.cones[info.renderSide][i].length){
+							auto dat=objects.cones[info.renderSide][i][j];
+							auto position=dat.position;
+							auto rotation=facingQuaternion(dat.lifetime);
+							auto fraction=(1.0f-cast(float)dat.lifetime/maxLifetime);
+							B.shadelessMaterialBackend.setAlpha(sacCommandCone.getAlpha(fraction));
+							auto vertScaling=1.0f+0.25f*fraction;
+							auto horzScaling=1.0f+2.0f*fraction;
+							auto scaling=Vector3f(horzScaling,horzScaling,vertScaling);
+							B.shadelessMaterialBackend.bindDiffuse(sacCommandCone.texture);
+							B.shadelessMaterialBackend.setTransformationScaled(position, rotation, scaling, rc);
+							sacCommandCone.mesh.render(rc);
+							enum numShells=8;
+							enum scalingFactor=0.95f;
+							foreach(k;0..numShells){
+								horzScaling*=scalingFactor;
+								rotation=facingQuaternion((k&1?-1.0f:1.0f)*2.0f*pi!float*fraction*(k+1));
+								scaling=Vector3f(horzScaling,horzScaling,vertScaling);
+								if(k+1==numShells) B.shadelessMaterialBackend.bindDiffuse(self.whiteTexture);
+								B.shadelessMaterialBackend.setTransformationScaled(position, rotation, scaling, rc);
+								sacCommandCone.mesh.render(rc);
+							}
+						}
+					}
+				}
+			}else static if(is(T==Highlights!B)){
+				static if(mode==RenderMode.transparent){
+					if(rc.shadowMode) return;
+					void renderHighlightsForSide(int highlightSide){
+						if(objects.highlights.length<=highlightSide) return;
+						//if(iota(CommandConeColor.max+1).all!(i=>objects.cones[highlightSide][i].empty)) return;
+						if(objects.highlights[highlightSide].length==0) return;
+						self.sacCommandCone.material.bind(rc);
+						B.disableCulling();
+						assert(self.sacCommandCone.material.backend is B.shadelessMaterialBackend);
+						B.shadelessMaterialBackend.setInformation(Vector4f(0.0f,0.0f,0.0f,0.0f));
+						B.shadelessMaterialBackend.setColor(Color4f(1.0f,0.75f,0.0f,1.0f));
+						B.shadelessMaterialBackend.setEnergy(1.0f);
+						enum maxLifetime=cast(int)(self.sacCommandCone.lifetime*updateFPS);
+						foreach(ref highlight;objects.highlights[highlightSide].data){
+							auto position=highlight.position,targetPosition=highlight.targetPosition;
+							auto frame=highlight.frame;
+							auto direction=(targetPosition-position);
+							auto dist=direction.length;
+							direction/=dist;
+							auto mainRotation=rotationBetween(Vector3f(0.0f,0.0f,1.0f),direction);
+							auto rotation=mainRotation*facingQuaternion(2.0f*pi!float*frame/(4*updateFPS));
+							auto fraction=1.0f; // TODO
+							//B.shadelessMaterialBackend.setAlpha(1.0f); // TODO
+							auto vertScaling=dist/sacCommandCone.height;
+							auto horzScaling=highlight.scale*highlight.width/(2.0f*sacCommandCone.radius);
+							auto scaling=Vector3f(horzScaling,horzScaling,0.98f*vertScaling);
+							B.shadelessMaterialBackend.bindDiffuse(self.sacCommandCone.texture);
+							B.shadelessMaterialBackend.setTransformationScaled(position, rotation, scaling, rc);
+							self.sacCommandCone.mesh.render(rc);
+							enum numShells=8;
+							enum scalingFactor=0.95f;
+							foreach(k;0..numShells){
+								horzScaling*=scalingFactor;
+								rotation=mainRotation*facingQuaternion((k&1?-1.0f:1.0f)*2.0f*pi!float*fraction*(k+1));
+								scaling=Vector3f(horzScaling,horzScaling,vertScaling*(0.98f+0.01f*sqrt(1.0f-(1.0f-(k+1.0f)/numShells)^^2)));
+								if(k+1==numShells) B.shadelessMaterialBackend.bindDiffuse(self.whiteTexture);
+								B.shadelessMaterialBackend.setTransformationScaled(position, rotation, scaling, rc);
+								self.sacCommandCone.mesh.render(rc);
+							}
+						}
+						self.sacCommandCone.material.unbind(rc);
+						auto material=self.highlightStar.material;
+						material.bind(rc);
+						foreach(ref highlight;objects.highlights[highlightSide].data){
+							auto position=highlight.position;
+							auto rotation=highlight.rotation;
+							auto mesh=self.highlightStar.mesh;
+							material.backend.setTransformation(position,rotation,rc);
+							mesh.render(rc);
+						}
+						B.enableCulling();
+						material.unbind(rc);
+					}
+					if(state.alliedBeamVision){
+						foreach(side;0..to!int(objects.highlights.length))
+							if(state.sides.getStance(side,info.renderSide)==Stance.ally)
+								renderHighlightsForSide(side);
+					}else renderHighlightsForSide(info.renderSide);
+				}
+			}else static assert(0);
+		}
+		with(EachByTypeFlags)
+			state.eachByType!(render,movingFirst|particlesBeforeEffects|opaqueEffectsBeforeParticles)(&this,options.enableWidgets,state,&info,rc);
+	}
+
+	bool selectionUpdated=false;
+	CreatureGroup renderedSelection;
+	CreatureGroup rectangleSelection;
+	void renderCreatureStats(ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		bool updateRectangleSelect=false;
+		if(info.renderSide!=-1){
+			updateRectangleSelect=!selectionUpdated&&info.mouse.status==Mouse!B.Status.rectangleSelect&&!info.mouse.dragging;
+			if(updateRectangleSelect){
+				rectangleSelection=CreatureGroup.init;
+				if(info.mouse.additiveSelect) renderedSelection=state.getSelection(info.renderSide);
+				else renderedSelection=CreatureGroup.init;
+			}else if(!selectionUpdated) renderedSelection=state.getSelection(info.renderSide);
+		}else renderedSelection=CreatureGroup.init;
+		rc.information=Vector4f(0.0f,0.0f,0.0f,0.0f);
+		B.shadelessMaterialBackend.bind(null,rc);
+		scope(success) B.shadelessMaterialBackend.unbind(null,rc);
+		static void renderCreatureStat(B)(ref MovingObject!B obj,Renderer!B* self,bool healthAndMana,ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+			if(obj.creatureState.mode.among(CreatureMode.dying,CreatureMode.dead,CreatureMode.dissolving,CreatureMode.firewalk)) return;
+			if(info.renderSide!=obj.side&&(!obj.creatureState.mode.isVisibleToAI||obj.creatureStats.effects.stealth)) return;
+			if(state.fogOfWar3d&&info.renderSide!=obj.side&&!state.positionVisibleToSide(info.renderSide,obj.position)) return;
+			auto backend=B.shadelessMaterialBackend;
+			backend.bindDiffuse(self.sacHud.statusArrows);
+			auto isBlinking=obj.side==info.renderSide&&obj.notificationState.isBlinking(state);
+			backend.setColor(isBlinking?Color4f(1.0f,0.0f,0.0f,1.0f):state.sides.sideColor(obj.side));
+			// TODO: how is this actually supposed to work?
+			import animations;
+			auto hitbox0=obj.sacObject.hitbox(obj.rotation,obj.scale,AnimationState.stance1,0);
+			auto hitbox=obj.sacObject.hitbox(obj.rotation,obj.scale,obj.animationState,obj.frame/updateAnimFactor);
+			auto scaling=1.0f;
+			auto position=obj.position+Vector3f(0.5f*(hitbox[0].x+hitbox[1].x),0.5f*(hitbox[0].y+hitbox[1].y),0.5f*(hitbox[0].z+hitbox[1].z)+0.75f*(hitbox0[1].z-hitbox0[0].z)+0.5f*scaling);
+			backend.setSpriteTransformationScaled(position,scaling,rc);
+			self.sacHud.statusArrowMeshes[0].render(rc);
+			if(healthAndMana){
+				backend.bindDiffuse(self.whiteTexture);
+				enum width=92.0f/64.0f, height=10.0f/64.0f, gap=3.0f/64.0f;
+				Vector3f fixPre(Vector3f prescaling){ // TODO: This is a hack. get rid of this.
+					prescaling.x/=1.25f;
+					return prescaling;
+				}
+				if(obj.creatureStats.maxHealth!=0.0f){
+					Vector3f offset=Vector3f(0.0f,0.5f*height+0.5f,0.0f);
+					Vector3f prescaling=Vector3f(width,height,0.0f);
+					backend.setSpriteTransformationScaledPreprocess(position,scaling,offset,fixPre(prescaling),rc);
+					backend.setColor(Color4f(0.5f,0.0f,0.0f));
+					backend.setEnergy(4.0f);
+					self.sacHud.statusArrowMeshes[0].render(rc); // TODO: different mesh?
+					prescaling=Vector3f(width*obj.creatureStats.health/obj.creatureStats.maxHealth,height,0.0f);
+					backend.setSpriteTransformationScaledPreprocess(position,scaling,offset+Vector3f(-0.5f*(width-prescaling.x),0.0f,0.0f),fixPre(prescaling),rc);
+					backend.setColor(Color4f(1.0f,0.0f,0.0f));
+					backend.setEnergy(8.0f);
+					self.sacHud.statusArrowMeshes[0].render(rc); // TODO: different mesh?
+				}
+				if(obj.creatureStats.maxMana!=0.0f){
+					Vector3f offset=Vector3f(0.0f,1.5f*height+gap+0.5f,0.0f);
+					Vector3f prescaling=Vector3f(width,height,0.0f);
+					backend.setSpriteTransformationScaledPreprocess(position,scaling,offset,fixPre(prescaling),rc);
+					backend.setColor(Color4f(0.0f,0.25f,0.5f));
+					backend.setEnergy(2.5f);
+					self.sacHud.statusArrowMeshes[0].render(rc); // TODO: different mesh?
+					prescaling=Vector3f(width*obj.creatureStats.mana/obj.creatureStats.maxMana,height,0.0f);
+					backend.setSpriteTransformationScaledPreprocess(position,scaling,offset+Vector3f(-0.5f*(width-prescaling.x),0.0f,0.0f),fixPre(prescaling),rc);
+					backend.setColor(Color4f(0.0f,0.5f,1.0f));
+					backend.setEnergy(5.0f);
+					self.sacHud.statusArrowMeshes[0].render(rc); // TODO: different mesh?
+				}
+			}
+		}
+		static void renderOtherSides(B)(MovingObject!B obj,Renderer!B* self,bool updateRectangleSelect,ObjectState!B state,RenderInfo!B* info,B.RenderContext rc){
+			if(updateRectangleSelect){
+				if(info.mouse.loc==Mouse!B.Location.minimap){
+					// TODO: get rid of code duplication somehow
+					auto radius=self.minimapRadius(*info);
+					auto minimapFactor=info.hudScaling/info.camera.minimapZoom;
+					auto camPos=info.camera.position;
+					auto mapRotation=facingQuaternion(-degtorad(info.camera.turn));
+					auto minimapCenter=Vector3f(camPos.x,camPos.y,0.0f)+rotate(mapRotation,Vector3f(0.0f,info.camera.distance*3.73f,0.0f));
+					auto mapCenter=Vector3f(info.width-radius,info.height-radius,0);
+					auto relativePosition=obj.position-minimapCenter;
+					auto iconOffset=rotate(mapRotation,minimapFactor*Vector3f(relativePosition.x,-relativePosition.y,0));
+					auto iconCenter=mapCenter+iconOffset;
+					if(self.isOnMinimap(iconCenter.xy,*info)&&self.isInRectangleSelect(iconCenter.xy,*info)&&canSelect(info.renderSide,obj.id,state))
+						self.rectangleSelection.addSorted(obj.id);
+				}else{
+					auto hitbox=obj.sacObject.hitbox(obj.rotation,obj.scale,obj.animationState,obj.frame/updateAnimFactor); // TODO: share computation with some other place?
+					auto center=0.5f*(hitbox[0]+hitbox[1]);
+					auto center2d=transform(B.getModelViewProjectionMatrix(obj.position,obj.rotation,obj.scale),center);
+					if(center2d.z>1.0f) return;
+					auto screenPosition=Vector2f(0.5f*(center2d.x+1.0f)*info.width,0.5f*(1.0f-center2d.y)*info.height);
+					if(!state.terrainLineOfSight(info.camera.position,obj.position+rotate(obj.rotation,obj.scale*center))) return;
+					if(self.isInRectangleSelect(screenPosition,*info)&&canSelect(info.renderSide,obj.id,state)) self.rectangleSelection.addSorted(obj.id);
+				}
+			}
+			if(obj.side!=info.renderSide) renderCreatureStat!B(obj,self,false,state,*info,rc);
+		}
+		state.eachMoving!(renderOtherSides!B)(&this,updateRectangleSelect,state,&info,rc);
+		if(updateRectangleSelect) renderedSelection.addFront(rectangleSelection.creatureIds[]);
+		foreach(id;renderedSelection.creatureIds)
+			if(id) state.movingObjectById!(renderCreatureStat!B,(){})(id,&this,true,state,info,rc);
+	}
+
+	B.Mesh boxMesh=null;
+	void renderBox(Vector3f[2] sl,bool wireframe,B.RenderContext rc){
+		if(wireframe) B.enableWireframe();
+		if(!boxMesh) boxMesh=makeBoxMesh!B(1.0f,1.0f,1.0f);
+		hitboxMaterial.backend.setTransformationScaled(boxCenter(sl), Quaternionf.identity(), boxSize(sl), rc);
+		boxMesh.render(rc);
+		if(wireframe) B.disableWireframe();
+	}
+	bool showHitboxes=false;
+	B.Material hitboxMaterial=null;
+	void renderHitboxes(ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		static void render(T)(ref T objects,Renderer!B* self,ObjectState!B state,RenderInfo!B* info,B.RenderContext rc){
+			enum isMoving=is(T==MovingObjects!(B, renderMode), RenderMode renderMode);
+			enum isStatic=is(T==StaticObjects!(B, renderMode), RenderMode renderMode);
+			static if(isMoving){
+				auto sacObject=objects.sacObject;
+				foreach(j;0..objects.length){
+					auto hitbox=sacObject.hitbox(objects.rotations[j],objects.scales[j],objects.animationStates[j],objects.frames[j]/updateAnimFactor);
+					hitbox[0]+=objects.positions[j];
+					hitbox[1]+=objects.positions[j];
+					self.renderBox(hitbox,true,rc);
+					bool isFlying=objects.creatureStates[j].movement!=CreatureMovement.onGround;
+					auto meleeHitbox=sacObject.meleeHitbox(isFlying,objects.rotations[j],objects.scales[j],objects.animationStates[j],objects.frames[j]/updateAnimFactor);
+					meleeHitbox[0]+=objects.positions[j];
+					meleeHitbox[1]+=objects.positions[j];
+					self.renderBox(meleeHitbox,true,rc);
+					/+auto hands=sacObject.hands(objects.animationStates[j],objects.frames[j]/updateAnimFactor);
+					foreach(i;0..2){
+						if(hands[i] is Vector3f.init) continue;
+						hands[i]=objects.positions[j]+rotate(objects.rotations[j],hands[i]);
+						Vector3f[2] nbox;
+						nbox=[hands[i]-(0.2*Vector3f(1,1,1)),hands[i]+(0.2*Vector3f(1,1,1))];
+						renderBox(nbox,false,rc);
+					}+/
+					/+foreach(i;1..sacObject.saxsi.saxs.bones.length){
+						auto bhitbox=sacObject.saxsi.saxs.bones[i].hitbox;
+						foreach(ref x;bhitbox){
+							x=objectrs.positions[j]+rotate(objects.rotations[j],x*sacObject.animations[objects.animationStates[j]].frames[objects.frames[j]/updateAnimFactor].matrices[i]);
+						}
+						if(i!=23&&i!=26) continue;
+						//Vector3f[8] box=[Vector3f(-1,-1,-1),Vector3f(1,-1,-1),Vector3f(1,1,-1),Vector3f(-1,1,-1),Vector3f(-1,-1,1),Vector3f(1,-1,1),Vector3f(1,1,1),Vector3f(-1,1,1)];
+						foreach(curVert;0..8){
+							foreach(k;0..8){
+								Vector3f[2] nbox;
+								nbox=[bhitbox[curVert]-(0.05*Vector3f(1,1,1)),bhitbox[curVert]+(0.05*Vector3f(1,1,1))];
+								renderBox(nbox,false,rc);
+							}
+						}
+						/+Vector3f[8] hitbox=[Vector3f(-0.0730702, -0.0556806, 0),
+						 Vector3f(0.22243, -0.0556806, 0),
+						 Vector3f(-0.0730702, 0.0667194, 0),
+						 Vector3f(0.22243, 0.0667194, 0),
+						 Vector3f(0, -0.0556806, -0.247969),
+						 Vector3f(0, -0.0556806, -0.0355686),
+						 Vector3f(0, 0.0667194, -0.247969),
+						 Vector3f(0, 0.0667194, -0.0355686)];+/
+						//renderBox(hitbox,rc);
+					}+/
+				}
+			}else static if(isStatic){
+				auto sacObject=objects.sacObject;
+				foreach(j;0..objects.length){
+					foreach(hitbox;sacObject.hitboxes(objects.rotations[j],objects.scales[j])){
+						hitbox[0]+=objects.positions[j];
+						hitbox[1]+=objects.positions[j];
+						self.renderBox(hitbox,true,rc);
+					}
+				}
+			}
+		}
+		if(!hitboxMaterial){
+			hitboxMaterial=B.makeMaterial(B.shadelessMaterialBackend);
+			hitboxMaterial.diffuse=Color4f(1.0f,1.0f,1.0f,1.0f);
+		}
+		hitboxMaterial.bind(rc); scope(exit) hitboxMaterial.unbind(rc);
+		state.eachByType!(render,EachByTypeFlags.none)(&this,state,&info,rc);
+	}
+
+	void renderFrame(Vector2f position,Vector2f size,Color4f color,ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		B.colorHUDMaterialBackend2.bind(null,rc);
+		scope(success) B.colorHUDMaterialBackend2.unbind(null, rc);
+		auto scaling=Vector3f(size.x,size.y,1.0f);
+		B.colorHUDMaterialBackend2.setTransformationScaled(Vector3f(position.x,position.y,0.0f), Quaternionf.identity(), scaling, rc);
+		B.colorHUDMaterialBackend2.setColor(color);
+		border.render(rc);
+	}
+
+	static Vector2f[2] fixHitbox2dSize(Vector2f[2] position){
+		auto center=0.5f*(position[0]+position[1]);
+		auto size=position[1]-position[0];
+		foreach(k;0..2) size[k]=max(size[k],48.0f);
+		return [center-0.5f*size,center+0.5f*size];
+	}
+
+	void renderFrame(Vector3f[2] hitbox2d,Color4f color,ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		if(hitbox2d[0].z>1.0f){ info.mouse.inHitbox=false; return; }
+		Vector2f[2] position=[Vector2f(0.5f*(hitbox2d[0].x+1.0f)*info.width,0.5f*(1.0f-hitbox2d[1].y)*info.height),
+		                      Vector2f(0.5f*(hitbox2d[1].x+1.0f)*info.width,0.5f*(1.0f-hitbox2d[0].y)*info.height)];
+		position=fixHitbox2dSize(position);
+		auto size=position[1]-position[0];
+		renderFrame(position[0],size,color,state,info,rc);
+		info.mouse.inHitbox=info.mouse.loc==Mouse!B.Location.scene&&position[0].x<=info.mouse.x&&info.mouse.x<=position[1].x&&
+			position[0].y<=info.mouse.y&&info.mouse.y<=position[1].y;
+	}
+
+	void renderTargetFrame(ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		if(!info.mouse.showFrame) return;
+		if(info.mouse.target.id&&!state.isValidTarget(info.mouse.target.id,info.mouse.target.type)) info.mouse.target=Target.init;
+		if(info.mouse.target.type.among(TargetType.creature,TargetType.building)){
+			state.objectReadById!((ref objects,i,self,state,info,rc){
+				auto hitbox2d=objects.hitbox2d(i,B.getModelViewProjectionMatrix(objects.positions[i],objects.rotations[i],objects.scales[i]));
+				auto objSide=objects.side(i,state);
+				auto color=state.sides.sideColor(objSide);
+				self.renderFrame(hitbox2d,color,state,*info,rc);
+			})(info.mouse.target.id,&this,state,&info,rc);
+		}else if(info.mouse.target.type==TargetType.soul){
+			static void renderHitbox(B)(Soul!B soul,Renderer!B* self,ObjectState!B state,RenderInfo!B* info,B.RenderContext rc){
+				auto hitbox2d=soul.hitbox2d(B.getSpriteModelViewProjectionMatrix(soul.position+soul.scaling*Vector3f(0.0f,0.0f,1.25f*sacSoul.soulHeight)));
+				auto color=soulFrameColor[soul.color(info.renderSide,state)];
+				self.renderFrame(hitbox2d,color,state,*info,rc);
+			}
+			state.soulById!(renderHitbox!B,(){})(info.mouse.target.id,&this,state,&info,rc);
+		}
+	}
+	bool isInRectangleSelect(Vector2f position,ref RenderInfo!B info){
+		if(info.mouse.status!=Mouse!B.Status.rectangleSelect||info.mouse.dragging) return false;
+		auto x1=min(info.mouse.leftButtonX,info.mouse.x), x2=max(info.mouse.leftButtonX,info.mouse.x);
+		auto y1=min(info.mouse.leftButtonY,info.mouse.y), y2=max(info.mouse.leftButtonY,info.mouse.y);
+		return x1<=position.x&&position.x<=x2 && y1<=position.y&&position.y<=y2;
+	}
+	void renderRectangleSelectFrame(ref RenderInfo!B info,B.RenderContext rc){
+		if(info.mouse.status!=Mouse!B.Status.rectangleSelect||info.mouse.dragging) return;
+		auto x1=min(info.mouse.leftButtonX,info.mouse.x), x2=max(info.mouse.leftButtonX,info.mouse.x);
+		auto y1=min(info.mouse.leftButtonY,info.mouse.y), y2=max(info.mouse.leftButtonY,info.mouse.y);
+		auto color=Color4f(1.0f,1.0f,1.0f);
+		if(info.mouse.loc==Mouse!B.Location.minimap){
+			auto radius=minimapRadius(info);
+			x1=max(x1,info.width-2.0f*radius);
+			y1=max(y1,info.height-2.0f*radius);
+			color=Color4f(1.0f,0.0f,0.0f);
+		}
+		auto rectWidth=x2-x1,rectHeight=y2-y1;
+		B.colorHUDMaterialBackend.bind(null,rc);
+		scope(success) B.colorHUDMaterialBackend.unbind(null,rc);
+		B.colorHUDMaterialBackend.bindDiffuse(whiteTexture);
+		B.colorHUDMaterialBackend.setColor(color);
+		auto thickness=0.5f*info.hudScaling;
+		auto scaling1=Vector3f(rectWidth+thickness,thickness,0.0f);
+		auto position1=Vector3f(x1,y1,0.0f);
+		auto position2=Vector3f(x1,y2,0.0f);
+		B.colorHUDMaterialBackend.setTransformationScaled(position1, Quaternionf.identity(), scaling1, rc);
+		quad.render(rc);
+		B.colorHUDMaterialBackend.setTransformationScaled(position2, Quaternionf.identity(), scaling1, rc);
+		quad.render(rc);
+		auto scaling2=Vector3f(thickness,rectHeight+thickness,0.0f);
+		auto position3=Vector3f(x1,y1,0.0f);
+		auto position4=Vector3f(x2,y1,0.0f);
+		B.colorHUDMaterialBackend.setTransformationScaled(position3, Quaternionf.identity(), scaling2, rc);
+		quad.render(rc);
+		B.colorHUDMaterialBackend.setTransformationScaled(position4, Quaternionf.identity(), scaling2, rc);
+		quad.render(rc);
+	}
+	char[4] xmenuTargetId="\0\0\0\0";
+	void updateXmenuTarget(char[4] targetId,Vector2f position,Vector2f scaling,ref RenderInfo!B info){
+		if(!info.mouse.xmenuVisible) return;
+		auto topLeft=position;
+		auto bottomRight=position+scaling;
+		if(floor(topLeft.x)<=info.mouse.x&&info.mouse.x<=ceil(bottomRight.x)
+		   && floor(topLeft.y)<=info.mouse.y&&info.mouse.y<=ceil(bottomRight.y)){
+			xmenuTargetId=targetId;
+		}
+	}
+	void renderXmenu(ref RenderInfo!B info,B.RenderContext rc){
+		auto hudScaling=info.hudScaling;
+		float scale=32*hudScaling;
+		float sparkleScale=40*hudScaling;
+		xmenuTargetId="\0\0\0\0";
+		if(info.mouse.xmenuMiddleTargetId=="\0\0\0\0")
+			return;
+		B.hudMaterialBackend.bind(null,rc);
+		scope(exit) B.hudMaterialBackend.unbind(null, rc);
+		void renderIcon(char[4] tag,Vector2f offset){
+			if(tag=="\0\0\0\0") return;
+			auto target=Target(TargetType.spell,0,Vector3f.init,TargetLocation.spellbook);
+			auto position=Vector3f(info.mouse.xmenuOffsetX-0.5f*scale+offset.x,info.mouse.xmenuOffsetY-0.5f*scale+offset.y,0.0f);
+			updateXmenuTarget(tag,position.xy,Vector2f(scale,scale),info);
+			B.hudMaterialBackend.setTransformationScaled(position,Quaternionf.identity(),Vector3f(scale,scale,0.0f),rc);
+			B.hudMaterialBackend.bindDiffuse(sacXmenu.get(tag).icon);
+			B.hudMaterialBackend.setAlpha(1.0f);
+			B.enableTransparency();
+			quad.render(rc);
+			B.hudMaterialBackend.bindDiffuse(sacXmenu.sparkleTexture);
+			auto sparklePosition=Vector3f(info.mouse.xmenuOffsetX-0.5f*sparkleScale+offset.x,info.mouse.xmenuOffsetY-0.5f*sparkleScale+offset.y,0.0f);
+			B.enableAdditive();
+			B.hudMaterialBackend.setTransformationScaled(sparklePosition,Quaternionf.identity(),Vector3f(sparkleScale,sparkleScale,0.0f),rc);
+			sacXmenu.sparkleMeshes[info.mouse.frame%$].render(rc);
+		}
+		import xmnu;
+		char[4] transformTag(char[4] tag){
+			if(tag==XmnuTag.center) return info.mouse.xmenuCenterTargetId;
+			return tag;
+		}
+		renderIcon(info.mouse.xmenuMiddleTargetId,Vector2f(0.0f,0.0f));
+		auto xmnux=sacXmenu.get(info.mouse.xmenuMiddleTargetId);
+		auto up=xmnux.next[Xmnl.Dir.up];
+		if(up!=-1) renderIcon(transformTag(sacXmenu.entries[up].xmnu.tag),Vector2f(0.0f,-scale));
+		auto down=xmnux.next[Xmnl.Dir.down];
+		if(down!=-1) renderIcon(transformTag(sacXmenu.entries[down].xmnu.tag),Vector2f(0.0f,scale));
+		auto left=xmnux.next[Xmnl.Dir.left];
+		if(left!=-1) renderIcon(transformTag(sacXmenu.entries[left].xmnu.tag),Vector2f(-scale,0.0f));
+		auto right=xmnux.next[Xmnl.Dir.right];
+		if(right!=-1) renderIcon(transformTag(sacXmenu.entries[right].xmnu.tag),Vector2f(scale,0.0f));
+	}
+	void renderCursor(int size,ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		if(info.mouse.xmenuVisible) renderXmenu(info,rc);
+		float scale=size==-1?32*info.hudScaling:size;
+		if(state&&info.mouse.target.location.among(TargetLocation.minimap,TargetLocation.scene)&&
+		   info.mouse.target.id&&!state.isValidTarget(info.mouse.target.id,info.mouse.target.type))
+			info.mouse.target=Target.init;
+		auto position=Vector3f(info.mouse.x-0.5f*scale,info.mouse.y,0);
+		if(info.mouse.status==Mouse!B.Status.rectangleSelect&&!info.mouse.dragging) position.y-=1.0f;
+		auto scaling=Vector3f(scale,scale,1.0f);
+		if(info.mouse.status==Mouse!B.Status.icon&&!info.mouse.dragging){
+			auto iconPosition=position+Vector3f(0.0f,4.0f/32.0f*scale,0.0f);
+			if(!info.mouse.icon.among(MouseIcon.spell,MouseIcon.ability)){
+				auto material=sacCursor.iconMaterials[info.mouse.icon];
+				material.bind(rc);
+				material.backend.setTransformationScaled(iconPosition, Quaternionf.identity(), scaling, rc);
+				quad.render(rc);
+				material.unbind(rc);
+			}else{
+				B.hudMaterialBackend.bind(null,rc);
+				B.hudMaterialBackend.bindDiffuse(sacHud.pages);
+				B.hudMaterialBackend.setTransformationScaled(iconPosition, Quaternionf.identity(), scaling, rc);
+				/+B.SubQuad[3] pages=[creaturePage,spellPage,structurePage];
+				auto page=pages[info.mouse.spell.type];
+				page.render(rc);+/
+				B.hudMaterialBackend.bindDiffuse(info.mouse.spell.icon);
+				quad.render(rc);
+				B.hudMaterialBackend.unbind(null,rc);
+			}
+			if(!info.mouse.targetValid){
+				auto material=sacCursor.invalidTargetIconMaterial;
+				material.bind(rc);
+				material.backend.setTransformationScaled(iconPosition, Quaternionf.identity(), scaling, rc);
+				quad.render(rc);
+				material.unbind(rc);
+			}
+		}
+		auto material=sacCursor.materials[info.mouse.cursor];
+		material.bind(rc);
+		material.backend.setTransformationScaled(position, Quaternionf.identity(), scaling, rc);
+		quad.render(rc);
+		material.unbind(rc);
+		if(info.mouseSparkles.length){
+			auto mat=sacCursor.sparkleMaterial;
+			mat.bind(rc);
+			scope(exit) mat.unbind(rc);
+			foreach(ref sparkle;info.mouseSparkles.data){
+				auto spposition=Vector3f(sparkle.x,sparkle.y,0);
+				auto spscaling=Vector3f(scale,-scale,1.0f);
+				mat.backend.setTransformationScaled(spposition, Quaternionf.identity(), spscaling, rc);
+				auto mesh=sacCursor.getSparkleMesh(sparkle.frame);
+				mesh.render(rc);
+			}
+		}
+	}
+
+	SacCursor!B sacCursor;
+	SacXmenu!B sacXmenu;
+	B.Quad quad;
+	B.Texture whiteTexture;
+	B.CreatureFrame border;
+	SacHud!B sacHud;
+	B.SubQuad selectionRoster, minimapFrame, minimapCompass;
+	B.Texture healthColorTexture,manaColorTexture;
+	B.StatsFrame statsFrame;
+	B.SubQuad creatureTab,spellTab,structureTab,tabSelector;
+	B.SubQuad creaturePage,spellPage,structurePage;
+	B.Cooldown cooldown;
+	B.SubQuad spellbookFrame1,spellbookFrame2;
+	B.Material hudSoulMaterial;
+	B.Material minimapMaterial;
+	B.Texture minimapFogTexture;
+	B.MinimapMesh minimapFogQuad;
+	B.SubQuad minimapQuad;
+	B.SubQuad minimapAltarRing,minimapManalith,minimapWizard,minimapManafount,minimapShrine;
+	B.SubQuad minimapCreatureArrow,minimapStructureArrow;
+	B.SubQuad[7] minimapHighlight;
+	B.Font[FontType.max+1] fonts;
+	static struct HudOpt{ bool freetypeFonts; }
+	void initializeHUD(HudOpt options){
+		sacCursor=new SacCursor!B();
+		sacXmenu=new SacXmenu!B();
+		quad=B.makeQuad();
+		whiteTexture=B.makeTexture(makeOnePixelImage(Color4f(1.0f,1.0f,1.0f)));
+		border=B.makeCreatureFrame();
+		sacHud=new SacHud!B();
+		selectionRoster=B.makeSubQuad(-63.5f/128.0f,0.0f,63.5f/128.0f,2.0f);
+		healthColorTexture=B.makeTexture(makeOnePixelImage(healthColor));
+		manaColorTexture=B.makeTexture(makeOnePixelImage(manaColor));
+		minimapFrame=B.makeSubQuad(0.5f,0.5f,1.5f,1.5f);
+		minimapCompass=B.makeSubQuad(101.0f/128.0f,24.0f/128.0f,122.0f/128.0f,3.0f/128.0f);
+		statsFrame=B.makeStatsFrame();
+		creatureTab=B.makeSubQuad(1.0f/128.0f,0.0f,47.0f/128,48.0f/128.0f);
+		spellTab=B.makeSubQuad(49.0f/128.0f,0.0f,95.0f/128.0f,48.0f/128.0f);
+		structureTab=B.makeSubQuad(1.0f/128.0f,48.0f/128.0f,47.0f/128,96.0f/128.0f);
+		tabSelector=B.makeSubQuad(49.0f/128.0f,48.0f/128.0f,95.0f/128,96.0f/128.0f);
+		creaturePage=B.makeSubQuad(0.0f,0.0f,0.5f,0.5f);
+		spellPage=B.makeSubQuad(0.5f,0.0f,1.0f,0.5f);
+		structurePage=B.makeSubQuad(0.0f,0.5f,0.5f,1.0f);
+		cooldown=B.makeCooldown();
+		spellbookFrame1=B.makeSubQuad(0.5f,40.0f/128.0f,0.625f,48.0f/128.0f);
+		spellbookFrame2=B.makeSubQuad(80.5f/128.0f,32.5f/128.0f,1.0f,48.0f/128.0f);
+		assert(!!sacSoul.texture);
+		hudSoulMaterial=B.makeMaterial(B.hudMaterialBackend2);
+		hudSoulMaterial.blending=B.Blending.Transparent;
+		hudSoulMaterial.diffuse=sacSoul.texture;
+		// minimap
+		minimapMaterial=B.makeMaterial(B.minimapMaterialBackend);
+		minimapMaterial.diffuse=Color4f(1.0f,1.0f,1.0f,1.0f);
+		minimapMaterial.blending=B.Blending.Transparent;
+		import dlib.image.unmanaged: UnmanagedImageRGBA8;
+		import dlib.core.memory: New;
+		auto img=New!UnmanagedImageRGBA8(visionGridSize,visionGridSize);
+		img.data[]=0;
+		minimapFogTexture=B.makeTexture(img);
+		minimapFogTexture.useMipmapFiltering=false;
+		minimapFogQuad=B.makeMinimapMesh(4,2);
+		minimapFogQuad.vertices[0]=Vector2f(0.0f,0.0f);
+		minimapFogQuad.vertices[1]=Vector2f(2560.0f,0.0f);
+		minimapFogQuad.vertices[2]=Vector2f(0.0f,2560.0f);
+		minimapFogQuad.vertices[3]=Vector2f(2560.0f,2560.0f);
+		minimapFogQuad.texcoords[0]=Vector2f(0.0f,0.0f);
+		minimapFogQuad.texcoords[1]=Vector2f(1.0f,0.0f);
+		minimapFogQuad.texcoords[2]=Vector2f(0.0f,1.0f);
+		minimapFogQuad.texcoords[3]=Vector2f(1.0f,1.0f);
+		minimapFogQuad.indices[0]=[0,1,2];
+		minimapFogQuad.indices[1]=[1,3,2];
+		B.finalizeMinimapMesh(minimapFogQuad);
+		minimapQuad=B.makeSubQuad(16.5f/64.0f,4.5f/65.0f,16.5f/64.0f,4.5f/64.0f);
+		minimapAltarRing=B.makeSubQuad(1.0f/64.0f,1.0/65.0f,11.0f/64.0f,11.0f/64.0f);
+		minimapManalith=B.makeSubQuad(12.0f/64.0f,0.0/65.0f,24.0f/64.0f,12.0f/64.0f);
+		minimapWizard=B.makeSubQuad(25.5f/64.0f,1.0/65.0f,35.5f/64.0f,12.0f/64.0f);
+		minimapManafount=B.makeSubQuad(36.5f/64.0f,1.0/65.0f,47.0f/64.0f,11.0f/64.0f);
+		minimapShrine=B.makeSubQuad(48.0f/64.0f,0.0/65.0f,60.0f/64.0f,12.0f/64.0f);
+		minimapCreatureArrow=B.makeSubQuad(0.0f/64.0f,13.0/65.0f,11.0f/64.0f,24.0f/64.0f);
+		minimapStructureArrow=B.makeSubQuad(12.0f/64.0f,13.0/65.0f,23.0f/64.0f,24.0f/64.0f);
+		minimapHighlight=[
+			B.makeSubQuad(24.0f/64.0f,13.0/65.0f,35.0f/64.0f,23.5f/64.0f),
+			B.makeSubQuad(36.0f/64.0f,13.0/65.0f,47.0f/64.0f,23.5f/64.0f),
+			B.makeSubQuad(48.0f/64.0f,13.0/65.0f,59.0f/64.0f,23.5f/64.0f),
+
+			B.makeSubQuad(0.0f/64.0f,24.0/64.0f,11.0f/64.0f,36.0f/64.0f),
+			B.makeSubQuad(12.0f/64.0f,24.0/64.0f,23.0f/64.0f,36.0f/64.0f),
+			B.makeSubQuad(24.0f/64.0f,24.0/64.0f,35.0f/64.0f,36.0f/64.0f),
+			B.makeSubQuad(36.0f/64.0f,24.0/64.0f,47.0f/64.0f,36.0f/64.0f),
+		];
+		// freetype fonts
+		if(options.freetypeFonts){
+			fonts[FontType.fn08]=null; // B.loadFont(8*fontScaleFactor,"fonts/verdana.ttf"); // TODO: fancy color gradient
+			fonts[FontType.fn10]=B.loadFont(10*fontScaleFactor,"fonts/bookA.ttf");
+			fonts[FontType.fn12]=B.loadFont(12*fontScaleFactor,"fonts/elgar.ttf");
+			fonts[FontType.fndb]=null; // TODO: find font
+			fonts[FontType.fnwt]=B.loadFont(8*fontScaleFactor,"fonts/verdana.ttf"); // TODO: improve rendering
+			fonts[FontType.ft12]=B.loadFont(12*fontScaleFactor,"fonts/bookA.ttf");
+		}
+	}
+	enum fontScaleFactor=64;
+
+	void bindFont(SacFont!B font,B.RenderContext rc){
+		auto type=font.type;
+		if(!fonts[type]){
+			B.colorHUDMaterialBackend.bind(null,rc);
+			B.colorHUDMaterialBackend.bindDiffuse(font.texture);
+		}else fonts[type].bind(rc);
+	}
+	void unbindFont(SacFont!B font,B.RenderContext rc){
+		auto type=font.type;
+		if(fonts[type]) fonts[type].unbind(rc);
+		else B.colorHUDMaterialBackend.unbind(null,rc);
+	}
+	void setFontColor(SacFont!B font,Color4f color){
+		auto type=font.type;
+		if(fonts[type]) fonts[type].setColor(color);
+		else B.colorHUDMaterialBackend.setColor(color);
+	}
+	static Vector2f getFreetypeOffset(SacFont!B font){
+		auto type=font.type;
+		final switch(type)with(FontType){
+			case FontType.fndb: return Vector2f(0.0f,0.0f); // TODO
+
+			case FontType.fn08: return Vector2f(0.0f,2.0f);
+			case FontType.fnwt: return Vector2f(0.0f,2.0f);
+
+			case FontType.fn10: return Vector2f(0.5f,1.75f);
+			case FontType.fn12: return Vector2f(0.5f,1.0f);
+			case FontType.ft12: return Vector2f(0.5f,0.5f); // TODO: ok?
+		}
+	}
+	void drawText(SacFont!B font,const(char)[] text,float left,float top,FormatSettings settings,ref RenderInfo!B info,B.RenderContext rc){
+		auto type=font.type;
+		void drawLetter1(dchar c,B.SubQuad mesh,float x,float y,float width,float height){
+			B.colorHUDMaterialBackend.setTransformationScaled(Vector3f(x,y,0.0f),Quaternionf.identity(),Vector3f(width,height,0.0f),rc);
+			mesh.render(rc);
+		}
+		if(!fonts[type]){
+			font.write!drawLetter1(text,left,top,settings);
+		}else{
+			/+unbindFont(font,rc);
+			B.colorHUDMaterialBackend.bind(null,rc);
+			B.colorHUDMaterialBackend.bindDiffuse(font.texture);
+			B.colorHUDMaterialBackend.setColor(Color4f(0.0f,1.0f,0.0f,1.0f));
+			font.write!drawLetter1(text,left,top,settings);
+			B.colorHUDMaterialBackend.setColor(Color4f(1.0f,1.0f,0.0f,1.0f));
+			B.colorHUDMaterialBackend.unbind(null,rc);
+			bindFont(font,rc);
+			setFontColor(font,Color4f(1.0f,1.0f,1.0f,1.0f));+/
+			auto scale=1.5f*settings.scale;
+			auto ftOffset=scale*getFreetypeOffset(font);
+			if(type.among(FontType.fn08,FontType.fnwt)){
+				void drawLetter2(dchar c,B.SubQuad mesh,float x,float y,float width,float height){
+					float xscale=0.55f;
+					switch(c){
+						case 'f': x+=1.0f*scale; break;
+						case 'j': x+=1.0f*scale; break;
+						case 't': x+=0.5f*scale; break;
+						case 'v': x+=1.0f*scale; break;
+						case 'x': x+=1.0f*scale; break;
+						case 'y','ÿ','ý','ỳ': x+=1.0f*scale; break;
+						case 'A','Ä','Á','À','Ą': xscale=0.75f; break;
+						case 'H': x+=0.25f*scale; break;
+						case 'J': x+=1.0f*scale; break;
+						case 'M': x+=0.5f*scale; break;
+						case 'O','Ö','Ó','Ò': x+=0.5f*scale; break;
+						case 'T': x+=1.5f*scale; break;
+						case 'V': x+=1.0f*scale; break;
+						case 'X': x+=1.0f*scale; break;
+						case '/': x+=1.0f*scale; break;
+						case '@': x+=1.5f*scale; break;
+						default: break;
+					}
+					fonts[type].setTransformationScaled(Vector3f(x,y,0.0f),scale/fontScaleFactor*Vector3f(xscale,0.55f,1.0f),rc);
+					import std.ascii:isASCII,isPrintable;
+					if(!c.isASCII||c.isPrintable)
+						fonts[type].renderGlyph(c,0);
+				}
+				font.write!drawLetter2(text,left+ftOffset.x,top+ftOffset.y,settings);
+			}else{
+				void drawLetter3(dchar c,B.SubQuad mesh,float x,float y,float width,float height){
+					switch(c){
+						case '\'': x-=0.75f*scale; break;
+						default: break;
+					}
+					//fonts[type].setTransformationScaled(Vector3f(x,y,0.0f),0.63f*scale/fontScaleFactor*Vector3f(1.0f,1.0f,1.0f),rc);
+					fonts[type].setTransformationScaled(Vector3f(x,y,0.0f),Vector3f(width-scale,0.6f*scale/fontScaleFactor,0.0f),rc);
+					import std.ascii:isASCII,isPrintable;
+					if(!c.isASCII||c.isPrintable)
+						//fonts[type].renderGlyph(c,0);
+						fonts[type].renderGlyphUnit(c);
+				}
+				font.write!drawLetter3(text,left+ftOffset.x,top+ftOffset.y,settings);
+			}
+		}
+	}
+
+	auto spellbookTarget=Target.init;
+	SacSpell!B spellbookTargetSpell=null;
+	auto selectionRosterTarget=Target.init;
+	SacSpell!B selectionRosterTargetAbility=null;
+	auto minimapTarget=Target.init;
+	auto formTarget=Target.init;
+
+	bool isOnSelectionRoster(Vector2f center,ref RenderInfo!B info){
+		if(!info.hudVisible) return false;
+		auto scaling=info.hudScaling*Vector3f(138.0f,256.0f-64.0f,1.0f);
+		auto position=Vector3f(-34.0f*info.hudScaling,0.5*(info.height-scaling.y),0);
+		auto topLeft=position;
+		auto bottomRight=position+scaling;
+		return floor(topLeft.x)<=center.x&&center.x<=cast(int)ceil(bottomRight.x)
+			&& floor(topLeft.y)<=center.y&&center.y<=cast(int)ceil(bottomRight.y);
+	}
+	void updateSelectionRosterTarget(Target target,Vector2f position,Vector2f scaling,ref RenderInfo!B info){
+		if(!info.mouse.onSelectionRoster) return;
+		auto topLeft=position;
+		auto bottomRight=position+scaling;
+		if(floor(topLeft.x)<=info.mouse.x&&info.mouse.x<=ceil(bottomRight.x)
+		   && floor(topLeft.y)<=info.mouse.y&&info.mouse.y<=ceil(bottomRight.y))
+			selectionRosterTarget=target;
+	}
+	void updateSelectionRosterTargetAbility(Target target,SacSpell!B targetAbility,Vector2f position,Vector2f scaling,ref RenderInfo!B info){
+		if(!info.mouse.onSelectionRoster) return;
+		auto topLeft=position;
+		auto bottomRight=position+scaling;
+		if(floor(topLeft.x)<=info.mouse.x&&info.mouse.x<=ceil(bottomRight.x)
+		   && floor(topLeft.y)<=info.mouse.y&&info.mouse.y<=ceil(bottomRight.y)){
+			selectionRosterTarget=target;
+			selectionRosterTargetAbility=targetAbility;
+		}
+	}
+	void renderSelectionRoster(ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		if(info.mouse.onSelectionRoster){
+			selectionRosterTarget=Target.init;
+			selectionRosterTargetAbility=null;
+		}
+		auto material=sacHud.frameMaterial;
+		material.bind(rc);
+		scope(success) material.unbind(rc);
+		auto hudScaling=info.hudScaling;
+		auto scaling=info.hudScaling*Vector3f(138.0f,256.0f,1.0f);
+		auto position=Vector3f(-34.0f*info.hudScaling,0.5f*(info.height-scaling.y),0);
+		material.backend.setTransformationScaled(position, Quaternionf.identity(), scaling, rc);
+		selectionRoster.render(rc);
+		int i=0; // idiotic deprecation of foreach(int i,x;selection)
+		foreach(x;renderedSelection.creatureIds){
+			scope(success) i++;
+			if(!renderedSelection.creatureIds[i]) continue;
+			static void renderIcon(B)(MovingObject!B obj,int i,Vector3f position,Renderer!B* self,ObjectState!B state,RenderInfo!B* info,B.RenderContext rc){
+				if(obj.sacObject.icon){
+					auto cpos=position+info.hudScaling*Vector3f(i>=6?35.0f:-1.0f,(i%6)*32.0f,0.0f);
+					auto scaling=info.hudScaling*Vector3f(34.0f,32.0f,0.0f);
+					B.hudMaterialBackend.setTransformationScaled(cpos, Quaternionf.identity(), scaling, rc);
+					B.hudMaterialBackend.bindDiffuse(obj.sacObject.icon);
+					self.quad.render(rc);
+					if(info.mouse.onSelectionRoster){
+						auto target=Target(TargetType.creature,obj.id,obj.position,TargetLocation.selectionRoster);
+						self.updateSelectionRosterTarget(target,cpos.xy,scaling.xy,*info);
+					}
+					if(obj.creatureStats.maxHealth!=0.0f){
+						auto healthScaling=info .hudScaling*Vector3f(2.0f,30.0f*obj.creatureStats.health/obj.creatureStats.maxHealth,0.0f);
+						auto healthPos=cpos+Vector3f(info.hudScaling*32.0f,info.hudScaling*30.0f-healthScaling.y,0.0f);
+						B.hudMaterialBackend.setTransformationScaled(healthPos, Quaternionf.identity(), healthScaling, rc);
+						B.hudMaterialBackend.bindDiffuse(self.healthColorTexture);
+						self.quad.render(rc);
+					}
+					if(obj.creatureStats.maxMana!=0.0f){
+						auto manaScaling=info.hudScaling*Vector3f(2.0f,30.0f*obj.creatureStats.mana/obj.creatureStats.maxMana,0.0f);
+						auto manaPos=cpos+Vector3f(info.hudScaling*34.0f,info.hudScaling*30.0f-manaScaling.y,0.0f);
+						B.hudMaterialBackend.setTransformationScaled(manaPos, Quaternionf.identity(), manaScaling, rc);
+						B.hudMaterialBackend.bindDiffuse(self.manaColorTexture);
+						self.quad.render(rc);
+					}
+				}
+			}
+			state.movingObjectById!(renderIcon!B,(){})(renderedSelection.creatureIds[i],i,Vector3f(position.x+34.0f*info.hudScaling,0.5*(info.height-scaling.y)+32.0f*info.hudScaling,0.0f),&this,state,&info,rc);
+		}
+		auto ability=renderedSelection.ability(state);
+		if(ability&&ability.icon){
+			auto ascaling=info.hudScaling*Vector3f(34.0f,34.0f,0.0f);
+			auto apos=position+Vector3f(info.hudScaling*105.0f,0.5f*scaling.y-info.hudScaling*17.0f,0.0f);
+			B.hudMaterialBackend.setTransformationScaled(apos, Quaternionf.identity(), ascaling, rc);
+			B.hudMaterialBackend.bindDiffuse(ability.icon);
+			quad.render(rc);
+			if(info.mouse.onSelectionRoster){
+				auto target=Target(TargetType.ability,0,Vector3f.init,TargetLocation.selectionRoster);
+				updateSelectionRosterTargetAbility(target,ability,apos.xy,ascaling.xy,info);
+			}
+		}
+	}
+	float minimapRadius(ref RenderInfo!B info){ return info.hudScaling*80.0f; }
+	bool isOnMinimap(Vector2f position,ref RenderInfo!B info){
+		if(!info.hudVisible) return false;
+		auto radius=minimapRadius(info);
+		auto center=Vector2f(info.width-radius,info.height-radius);
+		return (position-center).lengthsqr<=radius*radius;
+	}
+	void updateMinimapTarget(Target target,Vector2f center,Vector2f scaling,ref RenderInfo!B info){
+		if(!info.mouse.onMinimap) return;
+		auto topLeft=center-0.5f*scaling;
+		auto bottomRight=center+0.5f*scaling;
+		if(cast(int)topLeft.x<=info.mouse.x&&info.mouse.x<=cast(int)(bottomRight.x+0.5f)
+		   && cast(int)topLeft.y<=info.mouse.y&&info.mouse.y<=cast(int)(bottomRight.y+0.5f))
+			minimapTarget=target;
+	}
+	void updateMinimapTargetTriangle(Target target,Vector3f[3] triangle,ref RenderInfo!B info){
+		if(!info.mouse.onMinimap) return;
+		auto mousePos=Vector3f(info.mouse.x,info.mouse.y,0.0f);
+		foreach(k;0..3) triangle[k]-=mousePos;
+		foreach(k;0..3)
+			if(cross(triangle[k],triangle[(k+1)%$]).z<0)
+				return;
+		minimapTarget=target;
+	}
+	void renderMinimap(ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		if(info.mouse.onMinimap) minimapTarget=Target.init;
+		if(!info.minimapVisible) return;
+		auto map=state.map;
+		auto radius=minimapRadius(info);
+		auto left=cast(int)(info.width-2.0f*radius), top=cast(int)(info.height-2.0f*radius);
+		int xOffset=0+info.xOffset;
+		int yOffset=info.windowHeight-cast(int)(info.height*info.screenScaling)-info.yOffset;
+		B.scissor(xOffset+cast(int)(left*info.screenScaling),0+yOffset,cast(int)((info.width-left)*info.screenScaling),cast(int)((info.height-top)*info.screenScaling));
+		auto hudScaling=info.hudScaling;
+		auto scaling=Vector3f(2.0f*radius,2.0f*radius,0f);
+		auto position=Vector3f(info.width-scaling.x,info.height-scaling.y,0);
+		auto material=minimapMaterial;
+		B.minimapMaterialBackend.center=Vector2f(info.width-radius,info.height-radius);
+		B.minimapMaterialBackend.radius=0.95f*radius;
+		material.bind(rc);
+		B.minimapMaterialBackend.setTransformationScaled(position, Quaternionf.identity(), scaling, rc);
+		B.minimapMaterialBackend.setColor(Color4f(0.0f,65.0f/255.0f,66.0f/255.0f,1.0f));
+		quad.render(rc);
+		auto minimapFactor=info.hudScaling/info.camera.minimapZoom;
+		auto camPos=info.camera.position;
+		auto mapRotation=facingQuaternion(-degtorad(info.camera.turn));
+		auto minimapCenter=Vector3f(camPos.x,camPos.y,0.0f)+rotate(mapRotation,Vector3f(0.0f,info.camera.distance*3.73f,0.0f));
+		auto minimapSize=Vector2f(2560.0f,2560.0f);
+		auto mapCenter=Vector3f(info.width-radius,info.height-radius,0);
+		auto mapPosition=mapCenter+rotate(mapRotation,minimapFactor*Vector3f(-minimapCenter.x,minimapCenter.y,0));
+		auto mapScaling=Vector3f(1,-1,1)*minimapFactor;
+		B.minimapMaterialBackend.setTransformationScaled(mapPosition,mapRotation,mapScaling,rc);
+		B.minimapMaterialBackend.setColor(Color4f(0.5f,0.5f,0.5f,1.0f));
+		foreach(i,mesh;map.minimapMeshes){
+			if(!mesh) continue;
+			B.minimapMaterialBackend.bindDiffuse(map.textures[i]);
+			mesh.render(rc);
+		}
+		if(state.fogOfWar&&0<=info.renderSide&&info.renderSide<state.sid.sides.length){
+			state.updateFogTexture(info.renderSide,minimapFogTexture.image.data);
+			B.updateTexture(minimapFogTexture);
+			B.minimapMaterialBackend.bindDiffuse(minimapFogTexture);
+			B.minimapMaterialBackend.setColor(Color4f(1.0f,1.0f,1.0f,1.0f));
+			minimapFogQuad.render(rc);
+		}
+		if(!state.isValidTarget(info.camera.target,TargetType.creature)) info.camera.target=0;
+		if(info.camera.target){
+			import std.typecons: Tuple,tuple;
+			auto facingPosition=state.movingObjectReadById!((ref objects,i)=>tuple(objects.creatureStates[i].facing,objects.positions[i]), function Tuple!(float,Vector3f)(){ assert(0); })(info.camera.target);
+			auto facing=facingPosition[0],targetPosition=facingPosition[1];
+			auto relativePosition=targetPosition-minimapCenter;
+			auto iconOffset=rotate(mapRotation,minimapFactor*Vector3f(relativePosition.x,-relativePosition.y,0));
+			auto iconCenter=mapCenter+iconOffset;
+			B.minimapMaterialBackend.bindDiffuse(whiteTexture);
+			B.minimapMaterialBackend.setColor(Color4f(1.0f,1.0f,0.0f,1.0f));
+			auto fovScaling=Vector3f(0.5f*info.hudScaling,2.0f*radius,0.0f);
+			auto angle=2.0f*pi!float*82.0f/360.0f;
+			auto fovRotation1=mapRotation*facingQuaternion(-facing-0.5f*angle+pi!float);
+			B.minimapMaterialBackend.setTransformationScaled(iconCenter+rotate(fovRotation1,Vector3f(-0.5f*fovScaling.x,0.0f,0.0f)),fovRotation1,fovScaling,rc);
+			quad.render(rc);
+			auto fovRotation2=mapRotation*facingQuaternion(-facing+0.5f*angle+pi!float);
+			B.minimapMaterialBackend.setTransformationScaled(iconCenter+rotate(fovRotation2,Vector3f(-0.5f*fovScaling.x,0.0f,0.0f)),fovRotation2,fovScaling,rc);
+			quad.render(rc);
+		}
+		if(info.mouse.onMinimap){
+			auto mouseOffset=Vector3f(info.mouse.x,info.mouse.y,0.0f)-mapCenter;
+			auto minimapPosition=minimapCenter+rotate(mapRotation,Vector3f(mouseOffset.x,-mouseOffset.y,0.0f)/minimapFactor);
+			minimapPosition.z=state.getHeight(minimapPosition);
+			auto target=Target(TargetType.terrain,0,minimapPosition,TargetLocation.minimap);
+			minimapTarget=target;
+		}
+		B.minimapMaterialBackend.bindDiffuse(sacHud.minimapIcons);
+		 // temporary scratch space. TODO: maybe share memory with other temporary scratch spaces
+		static Array!int creatureArrowIndices;
+		static Array!int structureArrowIndices;
+		static Array!int highlightedIndices;
+		void addHighlightsForSide(int highlightSide){
+			if(highlightSide>=state.obj.opaqueObjects.highlights.highlights.length)
+				return;
+			foreach(ref highlight;state.obj.opaqueObjects.highlights.highlights[highlightSide].data)
+				if(highlight.status!=HighlightStatus.shrinking&&highlight.target)
+					highlightedIndices~=highlight.target;
+		}
+		if(state.alliedBeamVision){
+			foreach(side;0..to!int(state.obj.opaqueObjects.highlights.highlights.length))
+				if(state.sides.getStance(side,info.renderSide)==Stance.ally)
+					addHighlightsForSide(side);
+		}else addHighlightsForSide(info.renderSide);
+		static bool isHighlighted(int id){ // TODO: can be slow if many highlights
+			foreach(hid;highlightedIndices.data)
+				if(id==hid)
+					return true;
+			return false;
+		}
+		static void render(T)(ref T objects,float minimapFactor,Vector3f minimapCenter,Vector3f mapCenter,float radius,Quaternionf mapRotation,Renderer!B* self,ObjectState!B state,RenderInfo!B* info,B.RenderContext rc){ // TODO: why does this need to be static? DMD bug?
+			enum isMoving=is(T==MovingObjects!(B, renderMode), RenderMode renderMode);
+			enum isStatic=is(T==StaticObjects!(B, renderMode), RenderMode renderMode);
+			static if((is(typeof(objects.sacObject))||is(T==Souls!(B)))&&!is(T==FixedObjects!B)){
+				auto defaultQuad=self.minimapQuad;
+				auto defaultIconScaling=info.hudScaling*Vector3f(2.0f,2.0f,0.0f);
+				static if(is(typeof(objects.sacObject))){
+					auto sacObject=objects.sacObject;
+					bool isManafount=false;
+					static if(isMoving){
+						enum mayShowArrow=true;
+						bool isWizard=false;
+						if(sacObject.isWizard){
+							isWizard=true;
+							defaultQuad=self.minimapWizard;
+							defaultIconScaling=info.hudScaling*Vector3f(11.0f,11.0f,0.0f);
+						}
+					}else{
+						bool mayShowArrow=false;
+						enum isWizard=false;
+						if(sacObject.isAltarRing){
+							mayShowArrow=true;
+							defaultQuad=self.minimapAltarRing;
+							defaultIconScaling=info.hudScaling*Vector3f(10.0f,10.0f,0.0f);
+						}else if(sacObject.isManalith){
+							mayShowArrow=true;
+							defaultQuad=self.minimapManalith;
+							defaultIconScaling=info.hudScaling*Vector3f(12.0f,12.0f,0.0f);
+						}else if(sacObject.isManafount){
+							isManafount=true;
+							defaultQuad=self.minimapManafount;
+							defaultIconScaling=info.hudScaling*Vector3f(11.0f,11.0f,0.0f);
+							B.minimapMaterialBackend.setColor(Color4f(0.0f,160.0f/255.0f,219.0f/255.0f,1.0f));
+						}else if(sacObject.isShrine){
+							mayShowArrow=true;
+							defaultQuad=self.minimapShrine;
+							defaultIconScaling=info.hudScaling*Vector3f(12.0f,12.0f,0.0f);
+						}
+					}
+				}else enum mayShowArrow=false;
+				enforce(objects.length<=uint.max);
+				foreach(j;0..cast(uint)objects.length){
+					auto quad=defaultQuad,iconScaling=defaultIconScaling;
+					static if(is(typeof(objects.sacObject))){
+						static if(isMoving){
+							if(objects.creatureStates[j].mode.among(CreatureMode.dead,CreatureMode.dissolving)) continue;
+							if(info.renderSide!=objects.sides[j]&&(!objects.creatureStates[j].mode.isVisibleToOtherSides||objects.creatureStatss[j].effects.stealth))
+								continue;
+						}
+						static if(isMoving){
+							bool highlighted=objects.creatureStatss[j].effects.numHighlights>0&&isHighlighted(objects.ids[j]);
+						}else enum highlighted=false; // TODO
+						if(highlighted){
+							static assert(updateFPS%3==0);
+							quad=self.minimapHighlight[state.frame/(updateFPS/3)%$];
+							iconScaling=info.hudScaling*Vector3f(12.0f,12.0f,12.0f);
+						}
+						static if(isMoving){
+							auto side=objects.sides[j];
+							auto flags=objects.creatureStatss[j].flags;
+							auto isBlinking=(side==info.renderSide&&objects.notificationStates[j].isBlinking(state))||
+								state.minimapAlertBlinking(info.renderSide,objects.ids[j]);
+						}else{
+							auto sideFlagsIsBlinking=state.buildingById!((ref b,state)=>tuple(b.side,b.flags,b.notificationState.isBlinking(state)),function Tuple!(int,int,bool)(){ assert(0); })(objects.buildingIds[j],state);
+							auto side=sideFlagsIsBlinking[0],flags=sideFlagsIsBlinking[1],isBlinking=side==info.renderSide&&sideFlagsIsBlinking[2];
+						}
+						import ntts: Flags;
+						if(flags&Flags.notOnMinimap) continue;
+						auto showArrow=mayShowArrow&&
+							(side==info.renderSide||highlighted||isWizard||
+							 !isMoving && state.sides.getStance(side,info.renderSide)==Stance.ally);
+					}else enum showArrow=false;
+					auto clipRadiusFactor=showArrow?0.92f:1.08f;
+					auto clipradiusSq=((clipRadiusFactor*radius+(showArrow?-1.0f:1.0f)*0.5f*iconScaling.x)*
+					                   (clipRadiusFactor*radius+(showArrow?-1.0f:1.0f)*0.5f*iconScaling.y));
+					static if(isStatic){
+						if(state.buildingById!((ref bldg,isManafount)=>!isManafount&&!bldg.isAltar&&bldg.health==0.0f||bldg.top,()=>true)(objects.buildingIds[j],isManafount)) // TODO: merge with side lookup!
+							continue;
+					}
+					static if(is(typeof(objects.sacObject))){
+						static if(isMoving){
+							if(objects.sides[j]!=info.renderSide&&!state.minimapVisibleToSide(info.renderSide,objects.ids[j],objects.sides[j])) continue;
+						}else{
+							if(side!=info.renderSide&&!(0<=side?state.minimapVisibleToSide(info.renderSide,objects.ids[j],side):state.positionExploredBySide(info.renderSide,objects.positions[j]))) continue;
+						}
+					}else static if(is(T==Souls!B)){
+						if(!state.soulVisibleOnMinimap(info.renderSide,objects[j])) continue;
+					}
+					static if(is(T==Souls!B)) auto position=objects[j].position-minimapCenter;
+					else auto position=objects.positions[j]-minimapCenter;
+					auto iconOffset=rotate(mapRotation,minimapFactor*Vector3f(position.x,-position.y,0));
+					if(iconOffset.lengthsqr<=clipradiusSq){
+						auto iconCenter=mapCenter+iconOffset;
+						static if(is(typeof(isBlinking))){
+							auto blinkScale=isBlinking||highlighted&&state.frame%(updateFPS/2)<updateFPS/4?(isMoving&&!highlighted&&!isWizard?3.0f:1.35f):1.0f;
+							B.minimapMaterialBackend.setTransformationScaled(iconCenter-0.5f*iconScaling*blinkScale,Quaternionf.identity(),iconScaling*blinkScale,rc);
+						}else B.minimapMaterialBackend.setTransformationScaled(iconCenter-0.5f*iconScaling,Quaternionf.identity(),iconScaling,rc);
+						static if(is(typeof(objects.sacObject))){
+							if(!isManafount){
+								auto color=isBlinking?Color4f(1.0f,0.0f,0.0f,1.0f):
+									highlighted&&state.frame%(updateFPS/2)<updateFPS/4?
+									(state.sides.sideColor(side)==Color4f(1.0f,1.0f,1.0f,1.0f)?Color4f(0.5f,0.5f,0.5f,1.0f):Color4f(1.0f,1.0f,1.0f,1.0f))
+									:state.sides.sideColor(side);
+								B.minimapMaterialBackend.setColor(color);
+							}
+						}else static if(is(T==Souls!B)){
+							auto soul=objects[j];
+							if(!soul.state.among(SoulState.normal,SoulState.emerging)) continue;
+							auto color=soulMinimapColor[soul.color(info.renderSide,state)];
+							B.minimapMaterialBackend.setColor(color);
+						}
+						quad.render(rc);
+						static if(is(typeof(objects.sacObject))){
+							if(info.mouse.onMinimap){
+								auto target=Target(isMoving?TargetType.creature:TargetType.building,objects.ids[j],objects.positions[j],TargetLocation.minimap);
+								self.updateMinimapTarget(target,iconCenter.xy,iconScaling.xy,*info);
+								if(self.isInRectangleSelect(iconCenter.xy,*info)&&canSelect(info.renderSide,objects.ids[j],state))
+									self.rectangleSelection.addSorted(objects.ids[j]);
+							}
+						}
+					}else static if(is(typeof(objects.sacObject))){
+						if(showArrow){
+							static if(isMoving) creatureArrowIndices~=objects.ids[j];
+							else structureArrowIndices~=objects.ids[j];
+						}
+					}
+				}
+			}else static if(is(T==FixedObjects!B)){
+				// do nothing
+			}else static if(is(T==Buildings!B)){
+				// do nothing
+			}else static if(is(T==Effects!B)){
+				// do nothing
+			}else static if(is(T==Particles!(B,kind),ParticleKind kind)){
+				// do nothing
+			}else static if(is(T==CommandCones!B)){
+				// do nothing
+			}else static if(is(T==Highlights!B)){
+				// do nothing
+			}else static assert(0);
+		}
+		state.eachByType!(render,EachByTypeFlags.movingFirst|EachByTypeFlags.wizardsLast)(minimapFactor,minimapCenter,mapCenter,radius,mapRotation,&this,state,&info,rc);
+		static void renderArrow(T)(ref T object,float minimapFactor,Vector3f minimapCenter,Vector3f mapCenter,float radius,Quaternionf mapRotation,Renderer!B* self,ObjectState!B state,RenderInfo!B* info,B.RenderContext rc){ // TODO: why does this need to be static? DMD bug?
+			static if(is(typeof(object.sacObject))&&!is(T==FixedObjects!B)){
+				auto sacObject=object.sacObject;
+				enum isMoving=is(T==MovingObject!B);
+				static if(isMoving){
+					bool highlighted=object.creatureStats.effects.numHighlights>0&&isHighlighted(object.id);
+				}else enum highlighted=false; // TODO
+				auto arrowQuad=isMoving?self.minimapCreatureArrow:self.minimapStructureArrow;
+				auto arrowScaling=info.hudScaling*Vector3f(11.0f,11.0f,0.0f);
+				auto position=object.position-minimapCenter;
+				auto iconOffset=rotate(mapRotation,minimapFactor*Vector3f(position.x,-position.y,0));
+				auto offset=iconOffset.normalized*(0.92f*radius-info.hudScaling*6.0f);
+				auto iconCenter=mapCenter+offset;
+				auto rotation=rotationQuaternion(Axis.z,pi!float/2+atan2(iconOffset.y,iconOffset.x));
+				static if(isMoving){
+					auto side=object.side;
+					auto isBlinking=side==info.renderSide&&object.notificationState.isBlinking(state);
+				}else{
+					auto sideIsBlinking=state.buildingById!((ref b,state)=>tuple(b.side,b.notificationState.isBlinking(state)),function Tuple!(int,bool)(){ assert(0); })(object.buildingId,state);
+					auto side=sideIsBlinking[0],isBlinking=side==info.renderSide&&sideIsBlinking[1];
+				}
+				auto blinkScale=isBlinking||highlighted&&state.frame%(updateFPS/2)<updateFPS/4?1.35f:1.0f;
+				B.minimapMaterialBackend.setTransformationScaled(iconCenter-rotate(rotation,0.5f*arrowScaling*blinkScale),rotation,arrowScaling*blinkScale,rc);
+				auto color=isBlinking?Color4f(1.0f,0.0f,0.0f,1.0f):
+					highlighted&&state.frame%(updateFPS/2)<updateFPS/4?
+					(state.sides.sideColor(side)==Color4f(1.0f,1.0f,1.0f,1.0f)?Color4f(0.5f,0.5f,0.5f,1.0f):Color4f(1.0f,1.0f,1.0f,1.0f))
+					:state.sides.sideColor(side);
+				B.minimapMaterialBackend.setColor(color);
+				arrowQuad.render(rc);
+				if(info.mouse.onMinimap){
+					auto target=Target(isMoving?TargetType.creature:TargetType.building,object.id,object.position,TargetLocation.minimap);
+					Vector3f[3] triangle=[Vector3f(0.0f,-9.0f,0.0f),Vector3f(6.0f,6.0f,0.0f),Vector3f(-6.0f,6.0f,0.0f)];
+					foreach(k;0..3) triangle[k]=iconCenter+rotate(rotation,info.hudScaling*triangle[k]);
+					self.updateMinimapTargetTriangle(target,triangle,*info);
+				}
+			}
+		}
+		static foreach(isMoving;[true,false])
+			foreach(id;isMoving?creatureArrowIndices.data:structureArrowIndices.data)
+				state.objectById!renderArrow(id,minimapFactor,minimapCenter,mapCenter,radius,mapRotation,&this,state,&info,rc);
+		creatureArrowIndices.length=0;
+		structureArrowIndices.length=0;
+		highlightedIndices.length=0;
+		material.unbind(rc);
+		material=sacHud.frameMaterial;
+		material.bind(rc);
+		material.backend.setTransformationScaled(position, Quaternionf.identity(), scaling, rc);
+		minimapFrame.render(rc);
+		auto compassScaling=0.8f*info.hudScaling*Vector3f(21.0f,21.0f,0.0f);
+		auto compassPosition=mapCenter+rotate(mapRotation,Vector3f(0.0f,radius-3.0f*info.hudScaling,0.0f)-0.5f*compassScaling);
+		material.backend.setTransformationScaled(compassPosition, mapRotation, compassScaling, rc);
+		B.scissor(0+xOffset,0+yOffset,cast(int)(info.width*info.screenScaling),cast(int)(info.height*info.screenScaling));
+		minimapCompass.render(rc);
+		material.unbind(rc);
+	}
+	void renderStats(ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		auto material=sacHud.frameMaterial;
+		material.bind(rc);
+		auto hudScaling=info.hudScaling;
+		auto scaling0=Vector3f(64.0f,96.0f,0.0f);
+		scaling0*=info.hudScaling;
+		auto scaling1=Vector3f(32.0f,96.0f,0.0f);
+		scaling1*=info.hudScaling;
+		auto position0=Vector3f(info.width-2*scaling1.x-scaling0.x,0,0);
+		auto position1=Vector3f(info.width-2*scaling1.x,0,0);
+		auto position2=Vector3f(info.width-scaling1.x,0,0);
+		material.backend.setTransformationScaled(position0, Quaternionf.identity(), scaling0, rc);
+		statsFrame.render(rc);
+		material.backend.setTransformationScaled(position1, Quaternionf.identity(), scaling1, rc);
+		statsFrame.render(rc);
+		material.backend.setTransformationScaled(position2, Quaternionf.identity(), scaling1, rc);
+		statsFrame.render(rc);
+		material.unbind(rc);
+		material=hudSoulMaterial;
+		material.bind(rc);
+		auto soulPosition=position0+0.5f*scaling0;
+		auto soulScaling=scaling0;
+		soulScaling.x/=sacSoul.soulWidth;
+		soulScaling.y/=sacSoul.soulHeight;
+		soulScaling.y*=-1;
+		soulScaling*=0.85f;
+		material.backend.setTransformationScaled(soulPosition, Quaternionf.identity(), soulScaling, rc);
+		sacSoul.getMesh(SoulColor.blue,info.hudSoulFrame/updateAnimFactor).render(rc);
+		material.unbind(rc);
+		if(!state.isValidTarget(info.camera.target,TargetType.creature)) info.camera.target=0;
+		if(info.camera.target){
+			static float getRelativeMana(B,RenderMode mode)(ref MovingObjects!(B,mode) objects,int i){
+				if(objects.creatureStatss[i].maxMana==0.0f) return 0.0f;
+				return objects.creatureStatss[i].mana/objects.creatureStatss[i].maxMana;
+			}
+			static float getRelativeHealth(B,RenderMode mode)(ref MovingObjects!(B,mode) objects,int i){
+				if(objects.creatureStatss[i].maxHealth==0.0f) return 0.0f;
+				return objects.creatureStatss[i].health/objects.creatureStatss[i].maxHealth;
+			}
+			void renderStatBar(Vector3f origin,float relativeSize,B.Material top,B.Material mid,B.Material bot){
+				auto maxScaling=info.hudScaling*Vector3f(32.0f,68.0f,0.0f);
+				auto position=origin+Vector3f(0.0f,info.hudScaling*14.0f+(1.0f-relativeSize)*maxScaling.y,0.0f);
+				auto scaling=Vector3f(maxScaling.x,maxScaling.y*relativeSize,0.0f);
+				auto topPosition=position+Vector3f(0.0f,-info.hudScaling*4.0f,0.0f);
+				auto topScaling=Vector3f(maxScaling.x,info.hudScaling*4.0f,0.0f);
+				auto bottomPosition=position+Vector3f(0.0f,scaling.y,0.0f);
+				auto bottomScaling=Vector3f(maxScaling.x,info.hudScaling*6.0f,0.0f);
+
+				B.Material[3] materials=[top,mid,bot];
+				Vector3f[3] positions=[topPosition,position,bottomPosition];
+				Vector3f[3] scalings=[topScaling,scaling,bottomScaling];
+				static foreach(i;0..3){
+					materials[i].bind(rc);
+					materials[i].backend.setTransformationScaled(positions[i], Quaternionf.identity(), scalings[i], rc);
+					quad.render(rc);
+					materials[i].unbind(rc);
+				}
+			}
+			auto relativeStats=state.movingObjectReadById!((ref objects,i)=>tuple(getRelativeMana(objects,i),getRelativeHealth(objects,i)),()=>tuple(0.0f,0.0f))(info.camera.target);
+			auto relativeMana=relativeStats[0];
+			renderStatBar(position1,relativeMana,sacHud.manaTopMaterial,sacHud.manaMaterial,sacHud.manaBottomMaterial);
+			auto relativeHealth=relativeStats[1];
+			renderStatBar(position2,relativeHealth,sacHud.healthTopMaterial,sacHud.healthMaterial,sacHud.healthBottomMaterial);
+		}
+	}
+
+	int numSpells=0;
+	bool isOnSpellbook(Vector2f center,ref RenderInfo!B info){
+		if(!info.hudVisible) return false;
+		auto hudScaling=info.hudScaling;
+		auto tabScaling=hudScaling*Vector2f(3*48.0f,48.0f);
+		auto tabPosition=Vector2f(0.0f,info.height-hudScaling*80.0f);
+		auto tabTopLeft=tabPosition;
+		auto tabBottomRight=tabPosition+tabScaling;
+		if(floor(tabTopLeft.x)<=center.x&&center.x<=ceil(tabBottomRight.x)&&
+		   floor(tabTopLeft.y)<=center.y&&center.y<=ceil(tabBottomRight.y))
+			return true;
+		auto spellScaling=hudScaling*Vector2f(numSpells*32.0f+12.0f,36.0f);
+		auto spellPosition=Vector2f(0.0f,info.height-spellScaling.y);
+		auto spellTopLeft=spellPosition;
+		auto spellBottomRight=spellPosition+spellScaling;
+		if(floor(spellTopLeft.x)<=center.x&&center.x<=ceil(spellBottomRight.x)&&
+		   floor(spellTopLeft.y)<=center.y&&center.y<=ceil(spellBottomRight.y))
+			return true;
+
+		return false;
+	}
+	void updateSpellbookTarget(Target target,SacSpell!B targetSpell,Vector2f position,Vector2f scaling,ref RenderInfo!B info){
+		if(!info.mouse.onSpellbook) return;
+		auto topLeft=position;
+		auto bottomRight=position+scaling;
+		if(floor(topLeft.x)<=info.mouse.x&&info.mouse.x<=ceil(bottomRight.x)
+		   && floor(topLeft.y)<=info.mouse.y&&info.mouse.y<=ceil(bottomRight.y)){
+			spellbookTarget=target;
+			spellbookTargetSpell=targetSpell;
+		}
+	}
+	void renderSpellbook(ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		if(info.mouse.onSpellbook){
+			spellbookTarget=Target.init;
+			spellbookTargetSpell=null;
+		}
+		auto hudScaling=info.hudScaling;
+		auto wizard=state.getWizard(info.camera.target);
+		//auto spells=state.getSpells(wizard).filter!(x=>x.spell.type==info.spellbookTab);
+		auto spells=state.getSpells(wizard).filterf(closure!((x,info)=>x.spell.type==info.spellbookTab)(&info));
+		numSpells=cast(int)spells.walkLength;
+		auto material=sacHud.frameMaterial; // TODO: share material binding with other drawing commands (or at least the backend binding)
+		material.bind(rc);
+		auto position=Vector3f(0.0f,info.height-hudScaling*32.0f,0.0f);
+		auto numFrameSegments=max(10,2*numSpells);
+		auto scaling=hudScaling*Vector3f(16.0f,8.0f,0.0f);
+		auto scaling2=hudScaling*Vector3f(48.0f,16.0f,0.0f);
+		auto position2=Vector3f(hudScaling*16.0f*numFrameSegments-4.0f+scaling2.y,info.height-hudScaling*48.0f,0.0f);
+		material.backend.setTransformationScaled(position2,facingQuaternion(pi!float/2),scaling2,rc);
+		spellbookFrame2.render(rc);
+		foreach(i;0..numFrameSegments){
+			auto positioni=position+hudScaling*Vector3f(16.0f*i,-8.0f,0.0f);
+			material.backend.setTransformationScaled(positioni,Quaternionf.identity(),scaling,rc);
+			spellbookFrame1.render(rc);
+		}
+		material.unbind(rc);
+		auto tabsPosition=Vector3f(0.0f,info.height-hudScaling*80.0f,0.0f);
+		auto tabScaling=hudScaling*Vector3f(48.0f,48.0f,0.0f);
+		auto tabs=tuple(creatureTab,spellTab,structureTab);
+		material=sacHud.tabsMaterial;
+		material.bind(rc);
+		foreach(i,tab;tabs){
+			auto tabPosition=tabsPosition+hudScaling*Vector3f(48.0f,0.0f,0.0f)*i;
+			auto target=Target(cast(TargetType)(TargetType.creatureTab+i),0,Vector3f.init,TargetLocation.spellbook);
+			updateSpellbookTarget(target,null,tabPosition.xy,tabScaling.xy,info);
+			material.backend.setTransformationScaled(tabPosition,Quaternionf.identity(),tabScaling,rc);
+			tab.render(rc);
+		}
+		material.backend.setTransformationScaled(tabsPosition+hudScaling*Vector3f(48.0f,0.0f,0.0f)*info.spellbookTab,Quaternionf.identity(),tabScaling,rc);
+		tabSelector.render(rc);
+		material.unbind(rc);
+		B.hudMaterialBackend.bind(null,rc);
+		B.hudMaterialBackend.bindDiffuse(sacHud.pages);
+		B.SubQuad[3] pages=[creaturePage,spellPage,structurePage];
+		auto page=pages[info.spellbookTab];
+		auto pageScaling=hudScaling*Vector3f(32.0f,32.0f,0.0f);
+		foreach(i,entry;enumerate(spells)){
+			auto pagePosition=Vector3f(i*pageScaling.x,info.height-pageScaling.y,0.0f);
+			auto target=Target(TargetType.spell,0,Vector3f.init,TargetLocation.spellbook);
+			updateSpellbookTarget(target,entry.spell,pagePosition.xy,pageScaling.xy,info);
+			B.hudMaterialBackend.setTransformationScaled(pagePosition,Quaternionf.identity(),pageScaling,rc);
+			page.render(rc);
+		}
+		auto mana=info.camera.target?state.movingObjectReadById!((ref objects,i)=>objects.creatureStatss[i].mana,function float()=>0.0f)(info.camera.target):0.0f;
+		auto souls=wizard?wizard.souls:0;
+		foreach(i,entry;enumerate(spells)){
+			auto factor=min(1.0f,mana/entry.spell.manaCost);
+			auto spellScaling=factor*pageScaling;
+			auto spellPosition=Vector3f((i+0.5f)*pageScaling.x-0.5f*spellScaling.x,info.height-0.5f*pageScaling.y-0.5f*spellScaling.y,0.0f);
+			B.hudMaterialBackend.setTransformationScaled(spellPosition,Quaternionf.identity(),spellScaling,rc);
+			B.hudMaterialBackend.bindDiffuse(entry.spell.icon);
+			B.hudMaterialBackend.setAlpha(factor);
+			quad.render(rc);
+			bool active=true;
+			if(entry.spell.tag==SpellTag.guardian&&!wizard.closestBuilding) active=false;
+			if(entry.spell.tag==SpellTag.desecrate&&!wizard.closestEnemyAltar) active=false;
+			if(entry.spell.tag==SpellTag.convert&&!wizard.closestShrine) active=false;
+			if(!active){
+				auto inactivePosition=Vector3f(i*pageScaling.x,info.height-pageScaling.y,0.0f);
+				B.hudMaterialBackend.setTransformationScaled(inactivePosition,Quaternionf.identity(),pageScaling,rc);
+				B.hudMaterialBackend.bindDiffuse(sacCursor.invalidTargetIconTexture);
+				B.hudMaterialBackend.setAlpha(1.0f);
+				quad.render(rc);
+			}
+			if(entry.spell.soulCost>souls){
+				auto spiritPosition=Vector3f(i*pageScaling.x,info.height-pageScaling.y,0.0f);
+				auto spiritScaling=hudScaling*Vector3f(16.0f,16.0f,0.0f);
+				B.hudMaterialBackend.setTransformationScaled(spiritPosition,Quaternionf.identity(),spiritScaling,rc);
+				B.hudMaterialBackend.bindDiffuse(sacHud.spirit);
+				B.hudMaterialBackend.setAlpha(1.0f);
+				quad.render(rc);
+			}
+		}
+		B.hudMaterialBackend.unbind(null,rc);
+		bool bound=false;
+		foreach(i,entry;enumerate(spells)){
+			if(entry.cooldown==0.0f) continue;
+			if(!bound){ B.cooldownMaterialBackend.bind(null,rc); bound=true; }
+			auto pagePosition=Vector3f((i+0.5f)*pageScaling.x,info.height-0.5f*pageScaling.y,0.0f);
+			B.cooldownMaterialBackend.setTransformationScaled(pagePosition,Quaternionf.identity(),pageScaling,rc);
+			float progress=1.0f-entry.cooldown/entry.maxCooldown;
+			B.cooldownMaterialBackend.setProgress(progress);
+			cooldown.render(rc);
+		}
+		if(bound){
+			B.cooldownMaterialBackend.unbind(null,rc);
+			bound=false;
+		}
+		material=sacHud.spellReadyMaterial;
+		foreach(i,entry;enumerate(spells)){
+			if(entry.readyFrame>=16*updateAnimFactor) continue;
+			if(!bound){ material.bind(rc); bound=true; }
+			auto flarePosition=Vector3f((i+0.5f)*pageScaling.x,info.height-0.5f*pageScaling.y,0.0f);
+			auto flareScaling=hudScaling*Vector3f(48.0f,48.0f,0.0f);
+			flareScaling.y*=-1.0f;
+			material.backend.setTransformationScaled(flarePosition,Quaternionf.identity(),flareScaling,rc);
+			sacHud.getSpellReadyMesh(entry.readyFrame).render(rc);
+		}
+		if(bound) material.unbind(rc);
+	}
+	bool statsVisible(ObjectState!B state,ref RenderInfo!B info){
+		if(!info.camera.target) return false;
+		if(!info.hudVisible) return false;
+		return .statsVisible(info.camera.target,state);
+	}
+	bool spellbookVisible(ObjectState!B state,ref RenderInfo!B info){
+		if(!info.camera.target) return false;
+		return .spellbookVisible(info.camera.target,state);
+	}
+	void renderHUD(ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		renderMinimap(state,info,rc);
+		if(!info.hudVisible) return;
+		if(info.renderSide!=-1){
+			if(statsVisible(state,info)) renderStats(state,info,rc);
+			renderSelectionRoster(state,info,rc);
+			if(spellbookVisible(state,info)) renderSpellbook(state,info,rc);
+		}
+	}
+
+	void renderMouseoverText(scope const(char)[] text,int cursorSize,ref RenderInfo!B info,B.RenderContext rc,int yoffset=-1,scope Color4f[] lineColors=null){
+		auto font=SacFont!B.get(FontType.fnwt);
+		auto hudScaling=info.hudScaling;
+		auto cursor=Vector3f(info.mouse.x, info.mouse.y, 0.0f);
+		FormatSettings settings = {flowType:FlowType.left, scale:hudScaling};
+		auto size=font.getSize(text,settings)+Vector2f((3.0f+3.0f)*hudScaling,(2.0f+4.0f)*hudScaling);
+		auto boxScale=Vector3f(size.x,size.y, 0.0f);
+		auto offset=Vector3f(cursorSize==-1?16*hudScaling:0.5f*cursorSize,yoffset*hudScaling, 0.0f);
+		if(info.mouse.x+offset.x+boxScale.x>info.width) offset.x=-boxScale.x;
+		auto upperLeft=cursor+offset;
+		upperLeft.y=min(upperLeft.y,info.height-boxScale.y);
+		upperLeft.y=max(upperLeft.y,0.0f);
+		B.colorHUDMaterialBackend.bind(null,rc);
+		B.colorHUDMaterialBackend.bindDiffuse(whiteTexture);
+		B.colorHUDMaterialBackend.setColor(Color4f(0.0f,0.0f,0.0f,0.68f));
+		B.colorHUDMaterialBackend.setTransformationScaled(upperLeft,Quaternionf.identity(),boxScale,rc);
+		quad.render(rc);
+		B.colorHUDMaterialBackend.unbind(null,rc);
+		/+B.colorHUDMaterialBackend.setColor(Color4f(1.0f,1.0f,1.0f,1.0f));
+		B.colorHUDMaterialBackend.bindDiffuse(font.texture);
+		void drawLetter(dchar c,B.SubQuad mesh,float x,float y,float width,float height){
+			B.colorHUDMaterialBackend.setTransformationScaled(Vector3f(x,y,0.0f),Quaternionf.identity(),Vector3f(width,height,0.0f),rc);
+			mesh.render(rc);
+		}+/
+		auto textPos=upperLeft+Vector3f(3.0f*hudScaling,2.0f*hudScaling);
+		bindFont(font,rc);
+		if(lineColors){
+			foreach(i,line;enumerate(text.splitter('\n'))){
+				//B.colorHUDMaterialBackend.setColor(lineColors[i]);
+				//font.write!drawLetter(line,textPos.x,textPos.y+i*hudScaling*font.lineHeight,settings);
+				setFontColor(font,lineColors[i]);
+				drawText(font,line,textPos.x,textPos.y+i*hudScaling*font.lineHeight,settings,info,rc);
+			}
+		}else{
+			//font.write!drawLetter(text,textPos.x,textPos.y,settings);
+			setFontColor(font,Color4f(1.0f,1.0f,1.0f,1.0f));
+			drawText(font,text,textPos.x,textPos.y,settings,info,rc);
+		}
+		unbindFont(font,rc);
+	}
+
+	void renderMouseoverBox(int cursorSize,ObjectState!B state,scope SacFormState!B[] forms,ref RenderInfo!B info,B.RenderContext rc){
+		auto target=info.mouse.target;
+		static bool requiresDelay(TargetType type){
+			final switch(type) with(TargetType){
+				case none,terrain,creatureTab,spellTab,structureTab,spell: return false;
+				case creature,building,soul,ability,xmenu,soulStat,manaStat,healthStat,formElement: return true;
+			}
+		}
+		if(requiresDelay(target.type)&&info.mouse.targetUpdateFrame+info.mouse.mouseoverBoxDelay>info.mouse.frame)
+			return;
+		char[4096] buffer='\0';
+		auto buf=buffer[];
+		// TODO: localization!
+		import std.format: formattedWrite;
+		final switch(target.type){
+			case TargetType.none, TargetType.terrain: break;
+			case TargetType.creature, TargetType.building:
+				if(!target.id||!state) break;
+				static struct NTTInfo{
+					bool valid=false;
+					B.Texture icon=null;
+					string name=null;
+					string sideName=null;
+					float relativeHealth;
+					bool dead=false;
+					int foesKilled=-1;
+					int foesGibbed=-1;
+					int foesDipped=-1;
+					int soulsDipped=-1;
+					float damageDealt=0.0f;
+					float amountHealed=0.0f;
+					int level=-1;
+					float relativeXP;
+				}
+				auto getNTTInfo(int id){
+					if(target.type==TargetType.creature){
+						return state.movingObjectReadById!((ref objects,i,renderSide){
+							auto icon=objects.sacObject.icon;
+							auto name=objects.sacObject.name;
+							string sideName=null;
+							int level=-1;
+							float relativeHealth=objects.health(i)/objects.creatureStatss[i].maxHealth;
+							auto relativeXP=float.init;
+							bool dead=objects.isDead(i);
+							auto foesKilled=-1;
+							auto foesGibbed=-1;
+							auto foesDipped=-1;
+							auto soulsDipped=-1;
+							float damageDealt=float.nan;
+							float amountHealed=float.nan;
+							if(auto wiz=objects.isWizard(i)?state.getWizard(objects.ids[i]):null){
+								if(wiz.name.length) name=wiz.name;
+								sideName=null;
+								if(objects.sides[i]==renderSide){
+									foesKilled=wiz.wizardStatistics.foesKilled;
+									foesGibbed=wiz.wizardStatistics.foesGibbed;
+									foesDipped=wiz.wizardStatistics.foesDipped;
+									soulsDipped=wiz.wizardStatistics.soulsDipped;
+									damageDealt=wiz.wizardStatistics.damageDealt;
+									amountHealed=wiz.wizardStatistics.amountHealed;
+									enforce(globalMinLevel<=wiz.level&&wiz.level<=globalMaxLevel);
+									relativeXP=max(0.0f,min(wiz.experience/xpForLevel[wiz.level+1],1.0f));
+								}
+								level=wiz.level;
+							}else{
+								sideName=getSideName(objects.sides[i],state);
+								if(objects.sides[i]==renderSide){
+									foesKilled=objects.creatureStatisticss[i].foesKilled;
+									foesGibbed=objects.creatureStatisticss[i].foesGibbed;
+								}
+							}
+							return NTTInfo(true,icon,name,sideName,relativeHealth,dead,foesKilled,foesGibbed,foesDipped,soulsDipped,damageDealt,amountHealed,level,relativeXP);
+						},()=>NTTInfo.init)(id,info.renderSide);
+					}else if(target.type==TargetType.building){
+						return state.staticObjectReadById!((ref objects,i,state){
+							return state.buildingById!((ref bldg,sacObject,state){
+								auto icon=sacObject.icon;
+								auto name=sacObject.name;
+								if(!icon) icon=bldg.sacBuilding.icon;
+								if(!name.length) name=bldg.sacBuilding.name;
+								string sideName=getSideName(bldg.side,state);
+								float relativeHealth=bldg.health/bldg.maxHealth(state);
+								if(isNaN(relativeHealth) && !name.length)
+									return NTTInfo.init;
+								return NTTInfo(true,icon,name,sideName,relativeHealth);
+							},()=>NTTInfo.init)(objects.buildingIds[i],objects.sacObject,state);
+						},()=>NTTInfo.init)(id,state);
+					}else assert(0);
+				}
+				auto nttInfo=getNTTInfo(target.id);
+				if(!nttInfo.valid) break;
+				if(nttInfo.dead){
+					buf.formattedWrite!"%s's corpse"(nttInfo.name);
+					renderMouseoverText(buffer[0..buf.ptr-buffer.ptr],cursorSize,info,rc);
+					break;
+				}
+				bool renderHealth=!isNaN(nttInfo.relativeHealth);
+				bool renderXP=!isNaN(nttInfo.relativeXP);
+				auto hudScaling=info.hudScaling;
+				auto cursor=Vector3f(info.mouse.x, info.mouse.y, 0.0f);
+				auto boxScale=Vector3f(220*hudScaling,(renderXP?103:renderHealth?(nttInfo.icon?70:56):40)*hudScaling, 0.0f);
+				auto offset=Vector3f(cursorSize==-1?16*hudScaling:0.5f*cursorSize,(renderXP?-44:renderHealth?(nttInfo.icon?-27:-20):-12)*hudScaling, 0.0f);
+				if(info.mouse.x+offset.x+boxScale.x>info.width) offset.x=-boxScale.x;
+				auto upperLeft=cursor+offset;
+				upperLeft.y=min(upperLeft.y,info.height-boxScale.y);
+				upperLeft.y=max(upperLeft.y,0.0f);
+				B.colorHUDMaterialBackend.bind(null,rc);
+				B.colorHUDMaterialBackend.bindDiffuse(whiteTexture);
+				B.colorHUDMaterialBackend.setColor(Color4f(0.0f,0.0f,0.0f,0.68f));
+				B.colorHUDMaterialBackend.setTransformationScaled(upperLeft,Quaternionf.identity(),boxScale,rc);
+				quad.render(rc);
+				B.colorHUDMaterialBackend.setColor(Color4f(1.0f,1.0f,1.0f,1.0f));
+				if(nttInfo.icon){
+					B.colorHUDMaterialBackend.bindDiffuse(nttInfo.icon);
+					auto iconPos=upperLeft+Vector3f(3.0f*hudScaling,3.0f*hudScaling,0.0f);
+					auto iconScale=Vector3f(32*hudScaling,32.0f*hudScaling,0.0f);
+					B.colorHUDMaterialBackend.setTransformationScaled(iconPos,Quaternionf.identity(),iconScale,rc);
+					quad.render(rc);
+				}
+				B.colorHUDMaterialBackend.unbind(null,rc);
+
+				auto font=SacFont!B.get(FontType.fnwt);
+				/+B.colorHUDMaterialBackend.bind(null,rc);
+				B.colorHUDMaterialBackend.bindDiffuse(font.texture);+/
+				if(nttInfo.sideName.length) buf.formattedWrite!"%s's %s"(nttInfo.sideName,nttInfo.name);
+				else buf.formattedWrite!"%s"(nttInfo.name);
+				if(nttInfo.level!=-1) buf.formattedWrite!"\nLevel %d"(nttInfo.level);
+				if(nttInfo.foesKilled!=-1) buf.formattedWrite!"\nFoes killed: %d"(nttInfo.foesKilled);
+				if(nttInfo.foesGibbed!=-1) buf.formattedWrite!"\nFoes gibbed: %d"(nttInfo.foesGibbed);
+				//if(nttInfo.foesDipped!=-1) buf.formattedWrite!"\nFoes dipped: %d"(nttInfo.foesDipped);
+				//if(nttInfo.foesDipped!=-1) buf.formattedWrite!"\nSouls dipped: %d"(nttInfo.soulsDipped);
+				//if(!isNaN(nttInfo.damageDealt)) buf.formattedWrite!"\nDamage dealt: %d"(cast(int)nttInfo.damageDealt);
+				//if(!isNaN(nttInfo.amountHealed)) buf.formattedWrite!"\nAmount healed: %d"(cast(int)nttInfo.amountHealed);
+				auto text=buffer[0..buf.ptr-buffer.ptr];
+				FormatSettings settings = {flowType:FlowType.left, scale:hudScaling};
+				auto infoPos=upperLeft+Vector3f((3.0f+32.0f+4.0f)*hudScaling,2.0f*hudScaling,0.0f);
+				/+void drawLetter(dchar c,B.SubQuad mesh,float x,float y,float width,float height){
+					B.colorHUDMaterialBackend.setTransformationScaled(Vector3f(x,y,0.0f),Quaternionf.identity(),Vector3f(width,height,0.0f),rc);
+					mesh.render(rc);
+				}
+				font.write!drawLetter(text,infoPos.x,infoPos.y,settings);+/
+				bindFont(font,rc);
+				setFontColor(font,Color4f(1.0f,1.0f,1.0f,1.0f));
+				drawText(font,text,infoPos.x,infoPos.y,settings,info,rc);
+				if(renderXP){
+					auto xpPos=upperLeft+Vector3f(9*hudScaling,75*hudScaling);
+					//font.write!drawLetter("Experience:",xpPos.x,xpPos.y,settings);
+					drawText(font,"Experience:",xpPos.x,xpPos.y,settings,info,rc);
+				}
+				unbindFont(font,rc);
+				void renderStatBar(Vector3f position,Vector3f maxScaling,float endScaling,float emptyScaling,float relativeSize){
+					auto rotation=rotationQuaternion(Axis.z,-pi!float/2);
+					auto emptyOffset=0.5f*(maxScaling.x-emptyScaling);
+					auto emptyPosition=position+rotate(rotation,Vector3f(emptyOffset,maxScaling.y*relativeSize+endScaling,0.0f));
+					auto fullEmptyScaling=Vector3f(emptyScaling,maxScaling.y*(1.0f-relativeSize),0.0f);
+					auto scaling=Vector3f(maxScaling.x,maxScaling.y*relativeSize,0.0f);
+					auto topPosition=position+rotate(rotation,Vector3f(0.0f,-endScaling,0.0f));
+					auto topScaling=Vector3f(maxScaling.x,endScaling,0.0f);
+					auto bottomPosition=position+rotate(rotation,Vector3f(0.0f,scaling.y,0.0f));
+					auto bottomScaling=Vector3f(maxScaling.x,endScaling,0.0f);
+
+					B.Material empty=sacHud.manaTopMaterial;
+					B.Material[3] materials=[sacHud.healthTopMaterial,sacHud.healthMaterial,sacHud.healthBottomMaterial];
+					Vector3f[3] positions=[topPosition,position,bottomPosition];
+					Vector3f[3] scalings=[topScaling,scaling,bottomScaling];
+					assert(empty.backend is B.colorHUDMaterialBackend);
+					B.colorHUDMaterialBackend.bind(null,rc);
+					B.disableCulling();
+					B.colorHUDMaterialBackend.bindDiffuse(sacHud.mana[0]);
+					B.colorHUDMaterialBackend.setColor(Color4f(0.25f,0.75f,1.5f,1.0f)); // TODO: alpha gradient
+					B.colorHUDMaterialBackend.setTransformationScaled(emptyPosition, rotation, fullEmptyScaling, rc);
+					quad.render(rc);
+					B.enableCulling();
+					B.colorHUDMaterialBackend.unbind(null,rc);
+					static foreach(i;0..3){
+						materials[i].bind(rc);
+						B.disableCulling();
+						materials[i].backend.setTransformationScaled(positions[i], rotation, scalings[i], rc);
+						quad.render(rc);
+						B.enableCulling();
+						materials[i].unbind(rc);
+					}
+				}
+				if(renderHealth){
+					auto healthBarOffset=Vector3f(11*hudScaling,(nttInfo.icon?49:41)*hudScaling,0.0f);
+					auto healthBarScaling=Vector3f(-11*hudScaling,boxScale.x-2*11*hudScaling,0.0f);
+					renderStatBar(upperLeft+healthBarOffset,healthBarScaling,2*hudScaling,-(5+2)*hudScaling,nttInfo.relativeHealth);
+				}
+				if(renderXP){
+					auto xpBarOffset=Vector3f(11*hudScaling,89*hudScaling,0.0f);
+					auto xpBarScaling=Vector3f(-7*hudScaling,boxScale.x-2*11*hudScaling,0.0f);
+					renderStatBar(upperLeft+xpBarOffset,xpBarScaling,2*hudScaling,-(3+2)*hudScaling,nttInfo.relativeXP);
+				}
+				break;
+			case TargetType.soul:
+				if(!state) break;
+				final switch(color(info.mouse.target.id,info.renderSide,state)){
+					case SoulColor.blue:
+						renderMouseoverText("Soul",cursorSize,info,rc);
+						break;
+					case SoulColor.red:
+						renderMouseoverText("Heathen soul\nConvert this.",cursorSize,info,rc,-6);
+						break;
+					case SoulColor.green:
+						if(!sacGreenSoul) goto case SoulColor.red;
+						renderMouseoverText("Allied soul",cursorSize,info,rc,-6);
+						break;
+				}
+				break;
+			case TargetType.creatureTab:
+				renderMouseoverText("Creation spells",cursorSize,info,rc);
+				break;
+			case TargetType.spellTab:
+				renderMouseoverText("Spells",cursorSize,info,rc);
+				break;
+			case TargetType.structureTab:
+				renderMouseoverText("Structure spells",cursorSize,info,rc);
+				break;
+			case TargetType.spell:
+				if(!state) break;
+				auto wizard=state.getWizard(info.camera.target);
+				if(!wizard) break;
+				auto availableMana=state.movingObjectReadById!((ref objects,i)=>objects.creatureStatss[i].mana,()=>float.init)(info.camera.target);
+				if(isNaN(availableMana)) break;
+				auto availableSouls=wizard.souls;
+				auto targetSpell=info.mouse.targetSpell;
+				if(!targetSpell||!targetSpell.name.length) break;
+				auto mana=targetSpell.manaCost;
+				auto souls=targetSpell.soulCost;
+				int yoffset=-6;
+				auto red=Color4f(1.0f,0.0f,0.0f,1.0f);
+				Color4f[3] lineColors=Color4f(1.0f,1.0f,1.0f,1.0);
+				buf.formattedWrite!"%s\nMana: %d/%d"(targetSpell.name,cast(int)floor(mana),cast(int)floor(availableMana));
+				int numLines=2;
+				bool manaRed=availableMana<mana;
+				if(manaRed) lineColors[1]=red;
+				if(targetSpell.type==SpellType.creature){
+					buf.formattedWrite!"\nSouls: %d"(souls);
+					numLines++;
+					bool soulsRed=availableSouls<souls;
+					if(soulsRed) lineColors[2]=red;
+					yoffset=-12;
+				}
+				renderMouseoverText(buffer[0..buf.ptr-buffer.ptr],cursorSize,info,rc,yoffset,lineColors[0..numLines]);
+				break;
+			case TargetType.ability:
+				auto targetSpell=info.mouse.targetSpell;
+				if(!targetSpell||!targetSpell.name.length) break;
+				auto abilityName=targetSpell.name;
+				if(state&&renderedSelection.creatureIds[0]){ // Hydro mod: the creature's own name for its ability
+					import hydromod:hydroAbilityNames;
+					auto ntt=state.movingObjectById!((ref obj)=>obj.sacObject.nttTag,()=>(char[4]).init)(renderedSelection.creatureIds[0]);
+					if(auto names=ntt in hydroAbilityNames) if(auto n=targetSpell.tag in *names) abilityName=*n;
+				}
+				renderMouseoverText(abilityName,cursorSize,info,rc);
+				break;
+			case TargetType.xmenu:
+				if(info.mouse.xmenuTargetId!="\0\0\0\0")
+					renderMouseoverText(sacXmenu.get(info.mouse.xmenuTargetId).name,cursorSize,info,rc);
+				break;
+			case TargetType.soulStat:
+				renderMouseoverText("Soul counter",cursorSize,info,rc);
+				break;
+			case TargetType.manaStat:
+				renderMouseoverText("Mana bar",cursorSize,info,rc);
+				break;
+			case TargetType.healthStat:
+				renderMouseoverText("Health bar",cursorSize,info,rc);
+				break;
+			case TargetType.formElement:
+				auto mouseoverText=forms[target.formIndex].elements[target.elementIndex].mouseoverText;
+				if(mouseoverText) renderMouseoverText(mouseoverText,cursorSize,info,rc);
+				break;
+		}
+	}
+
+	void renderText(ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		/+B.colorHUDMaterialBackend.bind(null,rc);
+		B.colorHUDMaterialBackend.bindDiffuse(font.texture);
+		void drawLetter(dchar c,B.SubQuad mesh,float x,float y,float width,float height){
+			B.colorHUDMaterialBackend.setTransformationScaled(Vector3f(x,y,0.0f),Quaternionf.identity(),Vector3f(width,height,0.0f),rc);
+			mesh.render(rc);
+		}+/
+		/*FormatSettings testSettings = {flowType: FlowType.left, scale: 2.0f*info.hudScaling, maxWidth: 0.5f*info.width};
+		font.write!drawLetter("Test.",0.0f,0.0f,testSettings);*/
+		// number of souls
+		if(info.renderSide!=-1 && statsVisible(state,info)){
+			if(auto wizard=state.getWizard(info.camera.target)){
+				auto font=SacFont!B.get(FontType.fn10);
+				char[32] buffer='\0';
+				import std.format: formattedWrite;
+				buffer[].formattedWrite!"%d"(wizard.souls);
+				import std.algorithm;
+				auto text=buffer[0..buffer[].countUntil('\0')];
+				FormatSettings settings = {flowType:FlowType.left, scale:info.hudScaling};
+				auto size=font.getSize(text,settings);
+				// TODO: get rid of code duplication
+				auto scaling0=Vector2f(64.0f,96.0f);
+				scaling0*=info.hudScaling;
+				auto scaling1=Vector3f(32.0f,96.0f);
+				scaling1*=info.hudScaling;
+				auto position0=Vector2f(info.width-2*scaling1.x-0.5f*scaling0.x,0.5f*scaling0.y);
+				auto soulPositionDark=position0-0.5f*size;
+				bindFont(font,rc);
+				//B.colorHUDMaterialBackend.setColor(Color4f(0.0f,0.0f,0.0f,1.0f));
+				//font.write!drawLetter(text,soulPositionDark.x,soulPositionDark.y,settings);
+				setFontColor(font,Color4f(0.0f,0.0f,0.0f,1.0f));
+				drawText(font,text,soulPositionDark.x,soulPositionDark.y,settings,info,rc);
+				auto soulPosition=position0-0.5f*(size+info.hudScaling);
+				//B.colorHUDMaterialBackend.setColor(Color4f(1.0f,1.0f,1.0f,1.0f));
+				//font.write!drawLetter(text,soulPosition.x,soulPosition.y,settings);
+				setFontColor(font,Color4f(1.0f,1.0f,1.0f,1.0f));
+				drawText(font,text,soulPosition.x,soulPosition.y,settings,info,rc);
+				unbindFont(font,rc);
+			}
+		}
+		static Array!char triggerBuffer;
+		if(state&&B.scene){
+			auto controller=B.scene.controller; // TODO: pass this in some other way?
+			if(controller&&controller.network){
+				triggerBuffer.length=0;
+				controller.network.timeoutText((scope const(char)[] text){ foreach(c;text) triggerBuffer~=c; });
+				if(triggerBuffer.length){
+					auto font=SacFont!B.get(FontType.fnwt);
+					bindFont(font,rc);
+					setFontColor(font,Color4f(1.0f,1.0f,1.0f,1.0f));
+					FormatSettings settings = {flowType:FlowType.left, scale:info.hudScaling};
+					auto size=font.getSize(triggerBuffer.data,settings);
+					auto offset=Vector2f(0.5f*(info.width-size.x),10*info.hudScaling);
+					drawText(font,triggerBuffer.data,offset.x,offset.y,settings,info,rc);
+					unbindFont(font,rc);
+				}
+			}
+		}
+		/+auto gameState=B.scene.state;
+		auto controller=B.scene.controller;
+		if(gameState&&controller&&controller.network){
+			char[1024] buf=0;
+			import std.format: formattedWrite;
+			buf[].formattedWrite!"%s %s (%s)\n%s\n%s (%s)\n%s\n%s\n%s %s"(
+				gameState.committedFrame,gameState.currentFrame,gameState.currentFrame-gameState.committedFrame,
+				controller.network.committedFrame-gameState.committedFrame,
+				controller.network.players.map!(x=>x.committedFrame),controller.network.players.map!(x=>x.committedFrame-gameState.committedFrame),
+				controller.network.players.map!(x=>x.status),
+				controller.network.players.map!(x=>x.ping.total!"msecs"),
+				controller.network.pauseOnDrop, controller.network.settings.pauseOnDrop
+			);
+			auto font=SacFont!B.get(FontType.fn10);
+			bindFont(font,rc);
+			setFontColor(font,Color4f(1.0f,1.0f,1.0f,1.0f));
+			import std.range,std.algorithm;
+			auto text=buf[0..buf[].countUntil(0)];
+			FormatSettings settings = {flowType:FlowType.left, scale:info.hudScaling};
+			drawText(font,text,2,2,settings,info,rc);
+			unbindFont(font,rc);
+			//B.colorHUDMaterialBackend.unbind(null,rc);
+		}+/
+		triggerBuffer.length=0;
+		triggerText((scope const(char)[] text){ foreach(c;text) triggerBuffer~=c; },state.trig,state);
+		if(triggerBuffer.length){
+			auto font=SacFont!B.get(FontType.fn10);
+			bindFont(font,rc);
+			setFontColor(font,Color4f(1.0f,1.0f,1.0f,1.0f));
+			FormatSettings settings = {flowType:FlowType.left, scale:info.hudScaling};
+			drawText(font,triggerBuffer.data,5*info.hudScaling,5*info.hudScaling,settings,info,rc);
+			unbindFont(font,rc);
+		}
+	}
+
+	void renderChatMessage(ref ChatMessage!B message,int yOffset,ref RenderInfo!B info,B.RenderContext rc){
+		B.colorHUDMaterialBackend.bind(null,rc);
+		B.colorHUDMaterialBackend.bindDiffuse(whiteTexture);
+		B.colorHUDMaterialBackend.setColor(Color4f(0.0f,0.0f,0.0f,174.0f/255.0f));
+		auto width=ChatMessage!B.boxWidth*info.hudScaling;
+		auto pixelHeight=ChatMessage!B.additionalBoxHeight+message.textHeight;
+		auto height=pixelHeight*info.hudScaling;
+		auto offset=Vector3f(0.5f*(info.width-width),yOffset*info.hudScaling,0.0f);
+		B.colorHUDMaterialBackend.setTransformationScaled(offset,Quaternionf.identity(),Vector3f(width,height,0.0f),rc);
+		quad.render(rc);
+		B.colorHUDMaterialBackend.unbind(null,rc);
+		/+void drawLetter(dchar c,B.SubQuad mesh,float x,float y,float width,float height){
+			B.colorHUDMaterialBackend.setTransformationScaled(Vector3f(x,y,0.0f),Quaternionf.identity(),Vector3f(width,height,0.0f),rc);
+			mesh.render(rc);
+		}+/
+		auto titleFont=SacFont!B.get(FontType.fn12);
+		auto titleSettings=FormatSettings(FlowType.left,info.hudScaling);
+		auto titleSize=titleFont.getSize(message.content.title.data,titleSettings);
+		auto titleOffset=Vector3f(0.5f*(info.width-titleSize.x),(yOffset+ChatMessage!B.titleOffset)*info.hudScaling,0.0f);
+		//B.colorHUDMaterialBackend.bindDiffuse(titleFont.texture);
+		//B.colorHUDMaterialBackend.setColor(Color4f(0.0f,1.0f,1.0f,1.0f));
+		//titleFont.write!drawLetter(message.content.title.data,titleOffset.x,titleOffset.y,titleSettings);
+		bindFont(titleFont,rc);
+		setFontColor(titleFont,Color4f(0.0f,1.0f,1.0f,1.0f));
+		drawText(titleFont,message.content.title.data,titleOffset.x,titleOffset.y,titleSettings,info,rc);
+		unbindFont(titleFont,rc);
+		auto font=SacFont!B.get(FontType.fn10);
+		auto settings=FormatSettings(FlowType.left,info.hudScaling,ChatMessage!B.maxWidth*info.hudScaling);
+		auto textSize=Vector2f(message.textWidth*info.hudScaling,message.textHeight*info.hudScaling);
+		auto textOffset=Vector3f(floor(0.5f*(info.width-textSize.x)),floor((yOffset+ChatMessage!B.messageOffset)*info.hudScaling),0.0f); // TODO: should be a bit further to the left?
+		//B.colorHUDMaterialBackend.bindDiffuse(font.texture);
+		//B.colorHUDMaterialBackend.setColor(Color4f(1.0f,1.0f,1.0f,1.0f));
+		//font.write!drawLetter(message.content.message.data,textOffset.x,textOffset.y,settings);
+		bindFont(font,rc);
+		setFontColor(font,Color4f(1.0f,1.0f,1.0f,1.0f));
+		drawText(font,message.content.message.data,textOffset.x,textOffset.y,settings,info,rc);
+		unbindFont(font,rc);
+	}
+
+	void renderChatMessages(ObjectState!B state,NetworkState!B networkState,ref RenderInfo!B info,B.RenderContext rc){
+		int slot=info.renderSlot;
+		auto frame=info.activeChatMessages.frame;
+		foreach(fromNetwork;0..2){{
+			if(!fromNetwork&&!state) continue;
+			if(fromNetwork&&!networkState) continue;
+			scope messages=(fromNetwork?networkState.chatMessages:state.obj.opaqueObjects.chatMessages).messages.data;
+			info.activeChatMessages.chatMessageIndex[fromNetwork]=min(info.activeChatMessages.chatMessageIndex[fromNetwork],messages.length);
+			// TODO: this may race a bit with game state updating in response to network
+			for(;;++info.activeChatMessages.chatMessageIndex[fromNetwork]){
+				auto i=info.activeChatMessages.chatMessageIndex[fromNetwork];
+				if(i>=messages.length) break;
+				if(!fromNetwork&&messages[i].startFrame>state.frame) break;
+				auto height=ChatMessage!B.additionalBoxHeight+messages[i].textHeight;
+				if(messages[i].visibleToSlot(slot,state))
+					info.activeChatMessages.add(i,height,ChatMessage!B.topOffset,ChatMessage!B.gapSize,!!fromNetwork,frame);
+			}
+		}}
+		for(int i=0;i<info.activeChatMessages.messages.length;){
+			auto fromNetwork=info.activeChatMessages.messages[i].fromNetwork;
+			if(!fromNetwork&&!state) continue;
+			if(fromNetwork&&!networkState) continue;
+			auto index=info.activeChatMessages.messages[i].index;
+			int messageFrame=info.activeChatMessages.messages[i].frame;
+			scope messages=(fromNetwork?networkState.chatMessages:state.obj.opaqueObjects.chatMessages).messages.data;
+			if(index<messages.length&&messages[index].visibleToSlot(slot,state)){
+				auto currentOffset=info.activeChatMessages.messages[i].offset;
+				renderChatMessage(messages[index],currentOffset,info,rc);
+			}
+			bool removed=false;
+			if(index<messages.length){
+				if(messageFrame+messages[index].lifetime<=frame||messages[index].startFrame+messages[index].lifetime<=state.frame){
+					info.activeChatMessages.remove(i);
+					removed=true;
+				}
+			}
+			if(!removed) i++;
+		}
+	}
+
+	/+void renderSacForm(SacForm!B sacForm,ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		B.colorHUDMaterialBackend.bind(null,rc);
+		void doIt(SacForm!B sacForm,Vector3f offset,Quaternionf rotation,Vector3f scale){
+			B.colorHUDMaterialBackend.setTransformationScaled(offset,rotation,scale,rc);
+			//import sacfont,form;
+			SacFont!B[FormFont.max+1] fonts;
+			import std.traits: EnumMembers;
+			foreach(formFont;EnumMembers!FormFont)
+				fonts[formFont]=formSacFont!B(formFont);
+			foreach(element,ref sacElement;sacForm.sacElements){
+				auto active=sacElement.type==ElementType.form||sacElement.id==sacForm.default_; // TODO: fix
+				// auto active=state.frame/60%2==1;
+				foreach(i,ref part;sacElement.parts){
+					B.colorHUDMaterialBackend.bindDiffuse(part.texture);
+					if(i==0&&sacElement.type==ElementType.canvas){
+						B.colorHUDMaterialBackend.setColor(Color4f(0.0f,0.0f,0.0f,1.0f));
+						part.mesh[active].render(rc); // TODO: actually get correct canvas contents
+						B.colorHUDMaterialBackend.setColor(Color4f(1.0f,1.0f,1.0f,1.0f));
+					}else part.mesh[active].render(rc);
+				}
+				foreach(i,ref subForm;sacElement.subForms){
+					doIt(subForm.form,offset+Vector3f(subForm.offset.x*scale.x,subForm.offset.y*scale.y,0.0f),rotation,scale);
+				}
+				foreach(ref text;sacElement.texts){
+					B.colorHUDMaterialBackend.unbind(null,rc);
+					auto font=fonts[text.font];
+					auto settings=FormatSettings(FlowType.left,scale.x);
+					/+B.colorHUDMaterialBackend.bindDiffuse(font.texture);
+					void drawLetter(dchar c,B.SubQuad mesh,float x,float y,float width,float height){
+						B.colorHUDMaterialBackend.setTransformationScaled(Vector3f(x,y,0.0f),Quaternionf.identity(),Vector3f(width,height,0.0f),rc);
+						mesh.render(rc);
+					}
+					font.write!drawLetter(text.text,offset.x+text.position.x*scale.x,offset.y+text.position.y*scale.y,settings);+/
+					bindFont(font,rc);
+					setFontColor(font,Color4f(1.0f,1.0f,1.0f,1.0f));
+					drawText(font,text.text,offset.x+text.position.x*scale.x,offset.y+text.position.y*scale.y,settings,info,rc);
+					unbindFont(font,rc);
+					B.colorHUDMaterialBackend.bind(null,rc);
+				}
+				if(sacElement.subForms.length||sacElement.texts.length){
+					B.colorHUDMaterialBackend.setTransformationScaled(offset,rotation,scale,rc);
+				}
+			}
+		}
+		auto offset=Vector3f(0.5f*(info.width-info.hudScaling*sacForm.width),0.5f*(info.height-info.hudScaling*sacForm.height),0.0f);
+		auto rotation=Quaternionf.identity();
+		auto scale=Vector3f(info.hudScaling,info.hudScaling,0.0f);
+		doIt(sacForm,offset,rotation,scale);
+		B.colorHUDMaterialBackend.unbind(null,rc);
+	}+/
+
+	void updateFormTarget(Target target,Vector2f position,Vector2f size,ref RenderInfo!B info){
+		if(!info.mouse.menuMode) return;
+		auto topLeft=position;
+		auto bottomRight=position+size;
+		if(floor(topLeft.x)<=info.mouse.x&&info.mouse.x<=ceil(bottomRight.x)
+		   && floor(topLeft.y)<=info.mouse.y&&info.mouse.y<=ceil(bottomRight.y)){
+			formTarget=target;
+		}
+	}
+
+	void renderForm(ref SacFormState!B form,ushort formIndex,ref RenderInfo!B info,B.RenderContext rc){
+		SacFont!B[FormFont.max+1] fonts;
+		import std.traits: EnumMembers;
+		foreach(formFont;EnumMembers!FormFont)
+			fonts[formFont]=formSacFont!B(formFont);
+		/+void drawLetter(dchar c,B.SubQuad mesh,float x,float y,float width,float height){
+			B.colorHUDMaterialBackend.setTransformationScaled(Vector3f(x,y,0.0f),Quaternionf.identity(),Vector3f(width,height,0.0f),rc);
+			mesh.render(rc);
+		}+/
+		void renderFormElements(SacForm!B sacForm,scope ElementState[] elements,int s,int e,int activeElement,int targetElement,Vector3f offset,Quaternionf rotation,Vector3f scale){
+			enforce(elements[s].type==ElementType.form&&elements[s].numChildren+1==e-s);
+			B.colorHUDMaterialBackend.setTransformationScaled(offset,rotation,scale,rc);
+			void renderElement(ref SacFormElement!B sacElement,ushort elementIndex,bool active,bool target){
+				if(!elements[elementIndex].visible) return;
+				if(!elements[elementIndex].enabled) B.colorHUDMaterialBackend.setAlpha(0.5f);
+				scope(success) if(!elements[elementIndex].enabled) B.colorHUDMaterialBackend.setAlpha(1.0f);
+				auto elementTarget=Target.onForm(formIndex,elementIndex);
+				assert(elementTarget.formIndex==formIndex&&elementTarget.elementIndex==elementIndex);
+				auto scaledOffset=Vector2f(sacElement.offset.x*scale.x,sacElement.offset.y*scale.y);
+				auto scaledSize=Vector2f(sacElement.size.x*scale.x,sacElement.size.y*scale.y);
+				if(sacElement.type!=ElementType.picture) // Hydro mod: pictures are decoration, they must not take clicks meant for buttons
+					updateFormTarget(elementTarget,Vector2f(offset.x,offset.y)+scaledOffset,scaledSize,info);
+				B.colorHUDMaterialBackend.setTransformationScaled(offset,rotation,scale,rc); // Hydro mod: reset before each element (pictures/button frames were drawn with a stale transform)
+				// active=state.frame/60%2==1;
+				foreach(i,ref part;sacElement.parts){
+					B.colorHUDMaterialBackend.bindDiffuse(part.texture);
+					if(i==0&&sacElement.type==ElementType.canvas){
+						B.colorHUDMaterialBackend.setColor(Color4f(0.0f,0.0f,0.0f,1.0f));
+						part.mesh[active].render(rc); // TODO: actually get correct canvas contents
+						B.colorHUDMaterialBackend.setColor(Color4f(1.0f,1.0f,1.0f,1.0f));
+					}else if(i+1==sacElement.parts.length&&sacElement.type==ElementType.checkbox){
+						part.mesh[elements[elementIndex].checked].render(rc);
+					}else{
+						part.mesh[active].render(rc);
+					}
+				}
+				auto settings=FormatSettings(FlowType.left,scale.x);
+				B.colorHUDMaterialBackend.unbind(null,rc);
+				foreach(ref text;sacElement.texts){
+					auto font=fonts[text.font];
+					/+B.colorHUDMaterialBackend.bindDiffuse(font.texture);
+					font.write!drawLetter(text.text,offset.x+text.position.x*scale.x,offset.y+text.position.y*scale.y,settings);+/
+					bindFont(font,rc);
+					auto alpha=font.type==FontType.fn08?(target?1.0f:0.75f):1.0f;
+					auto grey=elements[elementIndex].enabled?1.0f:0.45f; // Hydro mod: unavailable buttons are greyed out
+					setFontColor(font,Color4f(grey,grey,grey,alpha));
+					const(char)[] textInput=elements[elementIndex].textInput.data[elements[elementIndex].textStart..elements[elementIndex].textEnd];
+					drawText(font,textInput.length?textInput:text.text,offset.x+text.position.x*scale.x,offset.y+text.position.y*scale.y,settings,info,rc);
+					unbindFont(font,rc);
+				}
+				if(elements[elementIndex].lines.length){ // Hydro mod: list / description lines in a textbox
+					auto el=&elements[elementIndex];
+					auto font=fonts[FormFont.standard];
+					enum lh=14.0f;
+					auto top=sacElement.offset.y+(sacElement.texts.length?26.0f:12.0f);
+					auto maxLines=max(1,cast(int)((sacElement.offset.y+sacElement.size.y-10.0f-top)/lh));
+					if(el.selectedLine>=0){
+						if(el.selectedLine<el.firstLine) el.firstLine=el.selectedLine;
+						if(el.selectedLine>=el.firstLine+maxLines) el.firstLine=el.selectedLine-maxLines+1;
+					}
+					el.firstLine=max(0,min(el.firstLine,cast(int)el.lines.length-maxLines));
+					el.linesX=offset.x+sacElement.offset.x*scale.x;
+					el.linesY=offset.y+top*scale.y;
+					el.lineHeight=lh*scale.y;
+					bindFont(font,rc);
+					foreach(i;el.firstLine..min(cast(int)el.lines.length,el.firstLine+maxLines)){
+						setFontColor(font,i==el.selectedLine?Color4f(1.0f,0.82f,0.3f,1.0f):Color4f(0.9f,0.9f,0.9f,1.0f));
+						auto line=el.lines[i];
+						if(line.length>44) line=line[0..44];
+						drawText(font,line,offset.x+(sacElement.offset.x+16.0f)*scale.x,offset.y+(top+lh*(i-el.firstLine))*scale.y,settings,info,rc);
+					}
+					unbindFont(font,rc);
+				}
+				if(sacElement.type==ElementType.entrybox){
+					auto font=fonts[FormFont.standard];
+					auto textPosition=Vector2f(offset.x+(sacElement.offset.x+20)*scale.x,offset.y+(sacElement.offset.y+3.0f)*scale.y);
+					const(char)[] text=elements[elementIndex].textInput.data[elements[elementIndex].textStart..elements[elementIndex].textEnd];
+					/+B.colorHUDMaterialBackend.bindDiffuse(font.texture);
+					font.write!drawLetter(text,textPosition.x,textPosition.y,settings);+/
+					bindFont(font,rc);
+					setFontColor(font,Color4f(1.0f,1.0f,1.0f,1.0f));
+					drawText(font,text,textPosition.x,textPosition.y,settings,info,rc);
+					unbindFont(font,rc);
+				}
+				B.colorHUDMaterialBackend.bind(null,rc);
+				B.colorHUDMaterialBackend.setColor(Color4f(1.0f,1.0f,1.0f,1.0f));
+				if(sacElement.texts.length||sacElement.type==ElementType.entrybox){
+					B.colorHUDMaterialBackend.setTransformationScaled(offset,rotation,scale,rc);
+				}
+			}
+			renderElement(sacForm.sacElements[0],to!ushort(s),true,targetElement!=-1); // render form itself
+			for(int i=s+1;i<e;i++){
+				if(elements[i].type!=ElementType.form){
+					enforce(sacForm.sacElements[elements[i].sacFormIndex].subForms.length==0);
+					renderElement(sacForm.sacElements[elements[i].sacFormIndex],to!ushort(i),i==activeElement,i==targetElement);
+				}else{
+					enforce(sacForm.sacElements[elements[i].sacFormIndex].subForms.length==1);
+					enforce(sacForm.sacElements[elements[i].sacFormIndex].parts.length==0);
+					enforce(sacForm.sacElements[elements[i].sacFormIndex].texts.length==0);
+					auto subOffsetRaw=sacForm.sacElements[elements[i].sacFormIndex].subForms[0].offset;
+					auto subOffset=Vector3f(subOffsetRaw.x*scale.x,subOffsetRaw.y*scale.y,0.0f);
+					auto subSacForm=sacForm.sacElements[elements[i].sacFormIndex].subForms[0].form;
+					auto numChildren=elements[i].numChildren;
+					renderFormElements(subSacForm,elements,i,i+1+numChildren,activeElement,targetElement,offset+subOffset,rotation,scale);
+					B.colorHUDMaterialBackend.setTransformationScaled(offset,rotation,scale,rc);
+					i+=numChildren;
+				}
+			}
+		}
+		auto sacForm=form.sacForm;
+		auto offset=Vector3f(0.5f*(info.width-info.hudScaling*sacForm.width),0.5f*(info.height-info.hudScaling*sacForm.height),0.0f);
+		auto rotation=Quaternionf.identity();
+		auto scale=Vector3f(info.hudScaling,info.hudScaling,0.0f);
+		auto elementIndex=-1;
+		if(info.mouse.target.type==TargetType.formElement&&info.mouse.target.formIndex==formIndex)
+			elementIndex=info.mouse.target.elementIndex;
+		renderFormElements(sacForm,form.elements.data,0,to!int(form.elements.data.length),form.activeIndex,elementIndex,offset,rotation,scale);
+	}
+
+	void renderForms(scope SacFormState!B[] forms,ref RenderInfo!B info,B.RenderContext rc){
+		if(info.mouse.menuMode) formTarget=Target.init;
+		B.colorHUDMaterialBackend.bind(null,rc);
+		B.colorHUDMaterialBackend.setColor(Color4f(1.0f,1.0f,1.0f,1.0f));
+		/+//auto sacForm=SacForm!B.get("tsor");
+		auto sacForm=SacForm!B.get("thci");
+		//auto sacForm=SacForm!B.get("nsol");
+		//auto sacForm=SacForm!B.get("rniw");
+		//auto sacForm=SacForm!B.get("stls");
+		//auto sacForm=SacForm!B.get("ybol");
+		//auto sacForm=SacForm!B.get("unmg");
+		//auto sacForm=SacForm!B.get("stpo");
+		//auto sacForm=SacForm!B.get("tpog");
+		//auto sacForm=SacForm!B.get("tpos");
+		//auto sacForm=SacForm!B.get("tpok");
+		//auto sacForm=SacForm!B.get("tpoc");
+		//auto sacForm=SacForm!B.get("tpmc");
+		renderSacForm(sacForm,info,rc);+/
+		/+auto formInstance=sacFormInstance!B("thci");
+		renderForm(formInstance,info,rc);+/
+		foreach(i,ref form;forms){
+			renderForm(form,to!ushort(i),info,rc);
+		}
+		B.colorHUDMaterialBackend.unbind(null,rc);
+	}
+
+	void renderShadowCastingEntities3D(R3DOpt options,ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		renderMap(state,info,rc);
+		renderNTTs!(RenderMode.opaque)(options,state,info,rc);
+	}
+
+	void renderOpaqueEntities3D(R3DOpt options,ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		renderMap(state,info,rc);
+		renderNTTs!(RenderMode.opaque)(options,state,info,rc);
+		if(showHitboxes) renderHitboxes(state,info,rc);
+	}
+	void renderTransparentEntities3D(R3DOpt options,ObjectState!B state,ref RenderInfo!B info,B.RenderContext rc){
+		renderSky(state,info,rc);
+		renderNTTs!(RenderMode.transparent)(options,state,info,rc);
+		renderCreatureStats(state,info,rc);
+	}
+	static struct R2DOpt{
+		int cursorSize;
+	}
+	void renderEntities2D(R2DOpt options,ObjectState!B state,NetworkState!B networkState,scope SacFormState!B[] forms,ref RenderInfo!B info,B.RenderContext rc){
+		if(info.mouse.visible){
+			if(state){
+				renderTargetFrame(state,info,rc);
+				renderHUD(state,info,rc);
+				renderText(state,info,rc);
+			}
+			renderChatMessages(state,networkState,info,rc);
+			renderForms(forms,info,rc);
+			renderRectangleSelectFrame(info,rc);
+			renderCursor(options.cursorSize,state,info,rc);
+			renderMouseoverBox(options.cursorSize,state,forms,info,rc);
+		}else{
+			if(state){
+				renderHUD(state,info,rc);
+				renderText(state,info,rc);
+			}
+			renderChatMessages(state,networkState,info,rc);
+		}
+	}
+}
+

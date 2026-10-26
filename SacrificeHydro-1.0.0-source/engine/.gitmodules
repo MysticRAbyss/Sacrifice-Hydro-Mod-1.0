@@ -1,0 +1,6 @@
+[submodule "dagon"]
+	path = dagon
+	url = ../dagon
+[submodule "dlib"]
+	path = dlib
+	url = ../dlib

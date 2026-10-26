@@ -1,0 +1,40 @@
+{
+    "description": "D language utility library",
+    "authors": [
+        "Timur Gafarov",
+        "Martin Cejp",
+        "Andrey Penechko",
+        "Vadim Lopatin",
+        "Nick Papanastasiou",
+        "Oleg Baharev", 
+        "Roman Chistokhodov", 
+        "Eugene Wissner",
+        "Roman Vlasov",
+        "Basile Burg",
+        "Valeriy Fedotov",
+        "Ferhat Kurtulmuş"
+    ],
+    "license": "BSL-1.0",
+    "homepage": "http://github.com/gecko0307/dlib",
+    "name": "dlib",
+    "importPaths": [
+        "."
+    ],
+    "buildRequirements":[
+        "allowWarnings"
+    ],
+    "lflags-linux-gdc": ["-lz"],
+    "configurations": [
+        {
+            "name": "library",
+            "targetType": "library",
+            "sourcePaths": ["dlib"]
+        },
+        {
+            "name": "import",
+            "targetType": "sourceLibrary",
+            "sourceFiles-posix": ["libdlib.a"],
+            "sourceFiles-windows": ["dlib.lib"]
+        }
+    ]
+}

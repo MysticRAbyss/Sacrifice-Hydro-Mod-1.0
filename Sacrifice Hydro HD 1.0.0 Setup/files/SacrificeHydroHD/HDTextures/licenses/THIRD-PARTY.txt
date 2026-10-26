@@ -1,0 +1,5 @@
+The HD texture builder (SacrificeHD.exe, from Sacrifice HD 1.1.0) bundles:
+- realesrgan-ncnn-vulkan (MIT) and Real-ESRGAN realesr-animevideov3 models (BSD-3-Clause), Xintao Wang et al.
+  https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan  https://github.com/xinntao/Real-ESRGAN
+- vcomp140.dll: Microsoft Visual C++ OpenMP runtime, redistributed as shipped with realesrgan-ncnn-vulkan.
+No files from Sacrifice itself are included; the builder reads the player's own installed copy.

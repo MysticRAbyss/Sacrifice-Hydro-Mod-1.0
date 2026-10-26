@@ -1,0 +1,174 @@
+diff --git a/src/dagon/core/application.d b/src/dagon/core/application.d
+index 4fd5a91..b6d137a 100644
+--- a/src/dagon/core/application.d
++++ b/src/dagon/core/application.d
+@@ -46,6 +46,10 @@ import derelict.freetype.ft;
+ 
+ import dagon.core.event;
+ 
++// Hydro mod: frame pacing, set before the application is made
++__gshared int swapInterval = -1; // -1: adaptive vsync (falls back to 1), 1: vsync, 0: off
++__gshared int fpsLimit = 0;       // frames per second at most (0: no limit)
++
+ void exitWithError(string message)
+ {
+     writeln(message);
+@@ -212,12 +216,14 @@ class Application: EventListener
+         if (window is null)
+             exitWithError("Failed to create window: " ~ to!string(SDL_GetError()));
+ 
+-        SDL_GL_SetSwapInterval(1);
+-
+         glcontext = SDL_GL_CreateContext(window);
+         if (glcontext is null)
+             exitWithError("Failed to create GL context: " ~ to!string(SDL_GetError()));
+ 
++        // Hydro mod: the swap interval needs the context (it was set before it, so it never applied)
++        if (SDL_GL_SetSwapInterval(swapInterval) != 0 && swapInterval == -1)
++            SDL_GL_SetSwapInterval(1);
++
+         SDL_GL_MakeCurrent(window, glcontext);
+ 
+         GLVersion loadedVersion = DerelictGL3.reload();
+@@ -285,12 +291,28 @@ class Application: EventListener
+     {
+         onRender(); // for lazy initialization
+         foreach(i;0..2) eventManager.update();
++        import core.time: MonoTime, dur;
++        import core.thread: Thread;
++        auto nextFrame = MonoTime.currTime;
+         while(eventManager.running)
+         {
+             beginRender();
+             onUpdate(eventManager.deltaTime);
+             onRender();
+             endRender();
++            if (fpsLimit > 0) // Hydro mod: frame rate cap
++            {
++                nextFrame += dur!"hnsecs"(10_000_000 / fpsLimit);
++                auto now = MonoTime.currTime;
++                if (nextFrame > now)
++                {
++                    auto wait = nextFrame - now;
++                    if (wait > dur!"msecs"(2)) Thread.sleep(wait - dur!"msecs"(1));
++                    while (MonoTime.currTime < nextFrame) {}
++                }
++                else if (now - nextFrame > dur!"msecs"(100))
++                    nextFrame = now;
++            }
+         }
+     }
+ 
+diff --git a/src/dagon/graphics/filters/hdr.d b/src/dagon/graphics/filters/hdr.d
+index cb4c3a2..acbaf3f 100644
+--- a/src/dagon/graphics/filters/hdr.d
++++ b/src/dagon/graphics/filters/hdr.d
+@@ -49,7 +49,8 @@ enum Tonemapper
+ {
+     Reinhard = 0,
+     Hable = 1,
+-    ACES = 2
++    ACES = 2,
++    Linear = 3 // Hydro mod: no tone curve (as in the original game): exposure, then gamma
+ }
+ 
+ class PostFilterHDR: PostFilter
+@@ -92,6 +93,8 @@ class PostFilterHDR: PostFilter
+ 
+         uniform float exposure;
+         uniform int tonemapFunction;
++        uniform float saturation;
++        uniform float contrast;
+ 
+         uniform bool useLUT;
+         uniform bool useVignette;
+@@ -183,13 +186,20 @@ class PostFilterHDR: PostFilter
+                 res = res / usedSamples;
+             }
+ 
+-            if (tonemapFunction == 2)
++            if (tonemapFunction == 3)
++                res = pow(clamp(res * exposure, 0.0, 1.0), vec3(1.0 / 2.2));
++            else if (tonemapFunction == 2)
+                 res = tonemapACES(res, exposure);
+             else if (tonemapFunction == 1)
+                 res = tonemapHable(res, exposure);
+             else
+                 res = tonemapReinhard(res, exposure);
+ 
++            // Hydro mod: colour grading
++            float luma = dot(res, vec3(0.2126, 0.7152, 0.0722));
++            res = mix(vec3(luma), res, saturation);
++            res = clamp((res - 0.5) * contrast + 0.5, 0.0, 1.0);
++
+             if (useVignette)
+                 res = mix(res, res * texture(vignette, vec2(texCoord.x, 1.0 - texCoord.y)).rgb, 0.8);
+ 
+@@ -213,6 +223,8 @@ class PostFilterHDR: PostFilter
+     GLint colorTableLoc;
+     GLint exposureLoc;
+     GLint tonemapFunctionLoc;
++    GLint saturationLoc;
++    GLint contrastLoc;
+     GLint useLUTLoc;
+     GLint vignetteLoc;
+     GLint useVignetteLoc;
+@@ -231,6 +243,8 @@ class PostFilterHDR: PostFilter
+ 
+     float exposure = 0.5f;
+     Tonemapper tonemapFunction = Tonemapper.ACES;
++    float saturation = 1.0f;
++    float contrast = 1.0f;
+ 
+     GLuint velocityTexture;
+     bool mblurEnabled = false;
+@@ -248,6 +262,8 @@ class PostFilterHDR: PostFilter
+         colorTableLoc = glGetUniformLocation(shaderProgram, "colorTable");
+         exposureLoc = glGetUniformLocation(shaderProgram, "exposure");
+         tonemapFunctionLoc = glGetUniformLocation(shaderProgram, "tonemapFunction");
++        saturationLoc = glGetUniformLocation(shaderProgram, "saturation");
++        contrastLoc = glGetUniformLocation(shaderProgram, "contrast");
+         useLUTLoc = glGetUniformLocation(shaderProgram, "useLUT");
+         vignetteLoc = glGetUniformLocation(shaderProgram, "vignette");
+         useVignetteLoc = glGetUniformLocation(shaderProgram, "useVignette");
+@@ -282,6 +298,8 @@ class PostFilterHDR: PostFilter
+         glUniform1i(colorTableLoc, 3);
+         glUniform1f(exposureLoc, exposure);
+         glUniform1i(tonemapFunctionLoc, tonemapFunction);
++        glUniform1f(saturationLoc, saturation);
++        glUniform1f(contrastLoc, contrast);
+         glUniform1i(useLUTLoc, (colorTable !is null));
+         glUniform1i(vignetteLoc, 4);
+         glUniform1i(useVignetteLoc, (vignette !is null));
+diff --git a/src/dagon/graphics/texture.d b/src/dagon/graphics/texture.d
+index 4c0946e..066089e 100644
+--- a/src/dagon/graphics/texture.d
++++ b/src/dagon/graphics/texture.d
+@@ -39,6 +39,9 @@ import dlib.math.vector;
+ 
+ import dagon.core.ownership;
+ 
++// Hydro mod: anisotropic filtering for every texture (0 or 1: off), set before textures are made
++__gshared float textureAnisotropy = 16.0f;
++
+ class Texture: Owner
+ {
+     SuperImage image;
+@@ -107,8 +110,15 @@ class Texture: Owner
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+         
+-        //if (DerelictGL.isExtSupported("GL_EXT_texture_filter_anisotropic"))
+-        //    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, 16.0f);
++        if (textureAnisotropy > 1.0f)
++        {
++            // GL_TEXTURE_MAX_ANISOTROPY / GL_MAX_TEXTURE_MAX_ANISOTROPY (core in 4.6, EXT before)
++            float maxAniso = 0.0f;
++            glGetFloatv(0x84FF, &maxAniso);
++            if (maxAniso > 1.0f)
++                glTexParameterf(GL_TEXTURE_2D, 0x84FE, fmin(textureAnisotropy, maxAniso));
++            while (glGetError() != GL_NO_ERROR) {}
++        }
+        
+         glTexImage2D(GL_TEXTURE_2D, 0, intFormat, width, height, 0, format, type, cast(void*)img.data.ptr);
+ 

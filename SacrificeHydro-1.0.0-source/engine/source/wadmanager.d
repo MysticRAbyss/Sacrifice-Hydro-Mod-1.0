@@ -1,0 +1,106 @@
+// copyright © tg
+// distributed under the terms of the gplv3 license
+// https://www.gnu.org/licenses/gpl-3.0.txt
+
+import util;
+import std.mmfile;
+import std.stdio, std.zlib, std.algorithm, std.path, std.conv;
+import std.string, std.exception;
+
+class WadManager{
+	MmFile[] wads;
+	ubyte[][string] files;
+	string[][char[4]] byExt;
+	private void toFile(alias filenameCallback,T...)(ubyte[] data,string name,T args){
+		files[name]=data;
+		byExt[name[$-4..$][0..4]]~=name;
+		static if(!is(typeof(filenameCallback)==int))
+			filenameCallback(data,name,args);
+	}
+	// hdDir (Hydro mod): a folder with high-resolution copies of some of the wads (Sacrifice HD's cache,
+	// same names and subfolders as in data); each one found there is read instead of the original
+	void indexWADs(string dataDir,string hdDir=null){
+		import std.file:dirEntries,SpanMode,exists,isFile;
+		int numHD=0;
+		foreach(string wad;dirEntries(dataDir,"*.wad",SpanMode.depth)){
+			enforce(wad.startsWith(dataDir)&&wad.endsWith(".wad"));
+			auto rel=relativePath(absolutePath(wad),absolutePath(dataDir));
+			auto directory=buildPath("extracted",rel[0..$-".wad".length]);
+			if(hdDir.length){
+				auto hd=buildPath(hdDir,rel);
+				if(exists(hd)&&isFile(hd)){ wad=hd; numHD++; }
+			}
+			indexWAD(wad,directory);
+			write(".");
+			stdout.flush();
+		}
+		writeln();
+		if(hdDir.length) writeln(numHD?text("using ",numHD," high-resolution wads from ",hdDir):text("no high-resolution wads in ",hdDir,"; using the original textures"));
+	}
+	void indexWAD(alias filenameCallback=0,alias dataCallback=0,bool memoryMap=true,T...)(string wadPath,string dirPath,T args){
+		static if(memoryMap){
+			auto wad=new MmFile(wadPath);
+			wads~=wad;
+			auto input=cast(ubyte[])wad[];
+		}else{
+			static import file=std.file;
+			auto input=cast(ubyte[])file.read(wadPath);
+		}
+		static if(!is(typeof(dataCallback)==int))
+			dataCallback(input,args);
+		auto infoOff=parseLE(input[4..8]);
+		auto infoSize=parseLE(input[8..12]);
+		auto unknown1=parseLE(input[12..16]);
+		auto unknown2=parseLE(input[16..20]);
+		size_t offset=20;
+		auto info=cast(ubyte[])uncompress(input[infoOff..$]);
+		int[string][string] names;
+		Stack!size_t dirSiz;
+		string odir=dirPath;
+		while(info.length){
+			auto tmp=info.eat(4).dup;
+			reverse(tmp);
+			auto name=cast(string)tmp.idup;
+			auto tmp2=info.eat(4).dup;
+			reverse(tmp2);
+			auto ext=cast(string)tmp2.idup;
+			if(ext !in names) names[ext]=(int[string]).init;
+			auto filename=buildPath(odir,normalizeFilename(name));
+			auto zsize=parseLE(info.eat(4));
+			auto size=parseLE(info.eat(4));
+			auto subfiles=parseLE(info.eat(4));
+			auto type=parseLE(info.eat(4));
+			auto unknown=parseLE(info.eat(4));
+			switch(type){
+				case 0: // uncompressed file
+					enforce(subfiles==0);
+					enforce(size==zsize);
+					toFile!filenameCallback(input[offset..offset+size],text(filename,".",ext),args);
+					offset+=size;
+					break;
+				case 2: // compressed file
+					enforce(subfiles==0);
+					toFile!filenameCallback((zsize?cast(ubyte[])uncompress(input[offset..offset+zsize]):[]),text(filename,".",ext),args);
+					offset+=zsize;
+					break;
+				case 1: // folder
+					if(!dirSiz.empty) --dirSiz.top;
+					odir=text(filename,".",ext);
+					dirSiz.push(subfiles);
+					break;
+				default:
+					//stderr.writeln("warning: unknown type ",type);
+					if(subfiles!=0) goto case 1;
+					enforce(subfiles==0);
+					if(zsize<size) goto case 2;
+					else goto case 0;
+			}
+			if(type!=1&&subfiles==0) --dirSiz.top;
+			while(!dirSiz.empty && dirSiz.top==0){
+				dirSiz.pop;
+				odir=dirName(odir);
+			}
+		}
+		enforce(dirSiz.empty);		
+	}
+}

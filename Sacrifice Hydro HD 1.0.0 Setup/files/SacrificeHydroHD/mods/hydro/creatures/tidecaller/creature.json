@@ -1,0 +1,76 @@
+{
+ "tag": "tdcl",
+ "model": "tdcl",
+ "name": "Tidecaller",
+ "god": "hydro",
+ "base": "rcha",
+ "level": 4,
+ "rawUV": true,
+ "stats": {
+  "spellOrder": 430,
+  "souls": 2,
+  "health": 1300,
+  "meleeStrength": 200,
+  "manaCost": 1000,
+  "ability1": "tdmd",
+  "runningSpeed": 1500,
+  "rangedAccuracy": 500,
+  "regeneration": 1250,
+  "creatureSSET": "drui",
+  "ability0": "fbow"
+ },
+ "abilityNames": {
+  "tdmd": "Tidal Mend",
+  "fbow": "Water Bolt"
+ },
+ "sounds": {
+  "selected": [
+   "tidecaller/selected1.wav",
+   "tidecaller/selected2.wav",
+   "tidecaller/line_selected1.wav",
+   "tidecaller/line_selected2.wav",
+   "tidecaller/line_selected3.wav"
+  ],
+  "annoyed": [
+   "tidecaller/annoyed1.wav",
+   "tidecaller/line_annoyed1.wav"
+  ],
+  "moving": [
+   "tidecaller/moving1.wav",
+   "tidecaller/moving2.wav",
+   "tidecaller/line_moving1.wav",
+   "tidecaller/line_moving2.wav"
+  ],
+  "attacking": [
+   "tidecaller/attacking1.wav",
+   "tidecaller/attacking2.wav",
+   "tidecaller/line_attacking1.wav",
+   "tidecaller/line_attacking2.wav"
+  ],
+  "damaged": [
+   "tidecaller/damaged1.wav",
+   "tidecaller/damaged2.wav",
+   "tidecaller/line_damaged1.wav"
+  ],
+  "death": [
+   "tidecaller/death1.wav",
+   "tidecaller/line_death1.wav"
+  ],
+  "melee": [
+   "tidecaller/attacking1.wav",
+   "tidecaller/attacking2.wav"
+  ],
+  "rescued": [
+   "tidecaller/selected1.wav",
+   "tidecaller/selected2.wav"
+  ]
+ },
+ "rangedAttack": {
+  "amount": 250,
+  "range": 55
+ },
+ "boltProjectile": true,
+ "shootFrom": {
+  "bone": 15
+ }
+}

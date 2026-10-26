@@ -1,0 +1,64 @@
+{
+  "tag": "rfsk",
+  "model": "rfsk",
+  "name": "Reefstalker",
+  "god": "hydro",
+  "base": "huma",
+  "level": 1,
+  "rawUV": true,
+  "stats": {
+    "spellOrder": 130,
+    "souls": 1,
+    "health": 545,
+    "meleeStrength": 90,
+    "manaCost": 300,
+    "runningSpeed": 1200,
+    "ability1": "",
+    "rangedAccuracy": 900,
+    "regeneration": 1250
+  },
+  "abilityNames": {
+    "fbow": "Water Bow"
+  },
+  "sounds": {
+    "selected": [
+      "reefstalker/selected1.wav",
+      "reefstalker/selected2.wav",
+      "reefstalker/line_selected1.wav",
+      "reefstalker/line_selected2.wav"
+    ],
+    "annoyed": [
+      "reefstalker/annoyed1.wav",
+      "reefstalker/line_annoyed1.wav"
+    ],
+    "moving": [
+      "reefstalker/moving1.wav",
+      "reefstalker/moving2.wav",
+      "reefstalker/line_moving1.wav",
+      "reefstalker/line_moving2.wav"
+    ],
+    "attacking": [
+      "reefstalker/attacking1.wav",
+      "reefstalker/attacking2.wav",
+      "reefstalker/line_attacking1.wav",
+      "reefstalker/line_attacking2.wav"
+    ],
+    "damaged": [
+      "reefstalker/damaged1.wav",
+      "reefstalker/damaged2.wav",
+      "reefstalker/line_damaged1.wav"
+    ],
+    "death": [
+      "reefstalker/death1.wav",
+      "reefstalker/line_death1.wav"
+    ],
+    "melee": [
+      "reefstalker/attacking1.wav",
+      "reefstalker/attacking2.wav"
+    ],
+    "rescued": [
+      "reefstalker/selected1.wav",
+      "reefstalker/selected2.wav"
+    ]
+  }
+}

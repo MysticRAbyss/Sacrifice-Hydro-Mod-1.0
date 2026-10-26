@@ -1,0 +1,56 @@
+{
+  "tag": "mstw",
+  "model": "mstw",
+  "name": "Mistwing",
+  "god": "hydro",
+  "base": "hsbt",
+  "level": 1,
+  "rawUV": true,
+  "stats": {
+    "spellOrder": 130,
+    "souls": 1,
+    "health": 450,
+    "meleeStrength": 75,
+    "manaCost": 300,
+    "flyingSpeed": 1600,
+    "ability1": "absh",
+    "rangedAccuracy": 800,
+    "regeneration": 1250
+  },
+  "abilityNames": {
+    "hsba": "Brine Spray",
+    "absh": "Bubble Shield"
+  },
+  "sounds": {
+    "selected": [
+      "mistwing/selected1.wav",
+      "mistwing/selected2.wav"
+    ],
+    "annoyed": [
+      "mistwing/annoyed1.wav"
+    ],
+    "moving": [
+      "mistwing/moving1.wav",
+      "mistwing/moving2.wav"
+    ],
+    "attacking": [
+      "mistwing/attacking1.wav",
+      "mistwing/attacking2.wav"
+    ],
+    "damaged": [
+      "mistwing/damaged1.wav",
+      "mistwing/damaged2.wav"
+    ],
+    "death": [
+      "mistwing/death1.wav"
+    ],
+    "melee": [
+      "mistwing/attacking1.wav",
+      "mistwing/attacking2.wav"
+    ],
+    "rescued": [
+      "mistwing/selected1.wav",
+      "mistwing/selected2.wav"
+    ]
+  }
+}

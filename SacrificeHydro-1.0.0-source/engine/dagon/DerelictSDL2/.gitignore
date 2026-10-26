@@ -1,0 +1,6 @@
+lib
+bin
+update.txt
+.dub
+dub.selections.json
+*.redub_cache_json

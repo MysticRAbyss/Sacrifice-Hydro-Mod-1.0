@@ -1,0 +1,57 @@
+{
+ "tag": "rfbr",
+ "model": "rfbr",
+ "name": "Reefbreaker",
+ "god": "hydro",
+ "base": "fclw",
+ "level": 6,
+ "rawUV": true,
+ "stats": {
+  "spellOrder": 630,
+  "souls": 3,
+  "health": 1450,
+  "meleeStrength": 90,
+  "manaCost": 1100,
+  "runningSpeed": 600,
+  "rangedAccuracy": 1500,
+  "regeneration": 1250
+ },
+ "abilityNames": {
+  "abfc": "Whirlpool Mortar"
+ },
+ "sounds": {
+  "selected": [
+   "reefbreaker/selected1.wav",
+   "reefbreaker/selected2.wav"
+  ],
+  "annoyed": [
+   "reefbreaker/annoyed1.wav"
+  ],
+  "moving": [
+   "reefbreaker/moving1.wav",
+   "reefbreaker/moving2.wav"
+  ],
+  "attacking": [
+   "reefbreaker/attacking1.wav",
+   "reefbreaker/attacking2.wav"
+  ],
+  "damaged": [
+   "reefbreaker/damaged1.wav",
+   "reefbreaker/damaged2.wav"
+  ],
+  "death": [
+   "reefbreaker/death1.wav"
+  ],
+  "melee": [
+   "reefbreaker/attacking1.wav",
+   "reefbreaker/attacking2.wav"
+  ],
+  "rescued": [
+   "reefbreaker/selected1.wav",
+   "reefbreaker/selected2.wav"
+  ]
+ },
+ "rangedAttack": {
+  "amount": 500
+ }
+}

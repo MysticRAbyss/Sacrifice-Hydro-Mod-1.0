@@ -1,0 +1,199 @@
+How to build Sacrifice: Hydro 1.0.0
+===================================
+
+This builds the four downloads of Sacrifice: Hydro and Sacrifice Hydro HD from this source folder:
+
+    SacrificeHydro-1.0.0-Setup.zip      SacrificeHydro-1.0.0-Manual.zip
+    SacrificeHydroHD-1.0.0-Setup.zip    SacrificeHydroHD-1.0.0-Manual.zip
+
+There are two parts:
+  A. the engine, Hydro.exe (D language, built with LDC and dub);
+  B. everything else - the launcher, the installers and the downloads (Go), built by one tool.
+Part B comes out byte for byte the same as the published 1.0.0, so anyone can check that the
+downloads contain exactly this code. Part A cannot (see step 5), but you can check that your
+Hydro.exe is built from the same code.
+
+The steps are written for Windows 10/11 (64-bit). They work the same on Linux or macOS (use
+"python3" and "/" in paths); the programs are always built for 64-bit Windows.
+
+
+1. Install the tools (once)
+---------------------------
+a) LDC 1.41.0, the D compiler (it includes dub, D's build tool):
+   https://github.com/ldc-developers/ldc/releases/tag/v1.41.0  ->  ldc2-1.41.0-windows-x64.7z
+   Unpack it, for example to C:\ldc2-1.41.0-windows-x64, and add its "bin" folder to PATH
+   (Start -> "Edit the system environment variables" -> Environment Variables -> Path -> New).
+   Check in a new Command Prompt:   ldc2 --version   and   dub --version
+b) Visual Studio 2022 Build Tools (free) with the "Desktop development with C++" workload:
+   https://visualstudio.microsoft.com/downloads/  ->  "Build Tools for Visual Studio 2022".
+   LDC uses its linker and Windows libraries. (LDC can also link without it, with the MinGW-based
+   libraries it brings along, but the Visual Studio way is the one sacengine's own scripts use.)
+c) Go 1.24.7, 64-bit: https://go.dev/dl/  ->  go1.24.7.windows-amd64.msi
+   Use exactly 1.24.7 if you want identical files; any newer Go also builds working programs,
+   only their checksums will differ.   Check:   go version   ->  go version go1.24.7 windows/amd64
+d) Python 3 (any recent version): https://www.python.org/downloads/
+   Tick "Add python.exe to PATH" in its installer.   Check:   python --version
+e) An internet connection the first time: dub downloads the engine's D libraries from
+   code.dlang.org (audio-formats 3.0.2, derelict-al 2.0.0-beta.2, derelict-ft 2.0.0-beta.5,
+   derelict-util 3.0.0-beta.2, derelict-mpg123 0.1.2 - the versions are fixed in
+   engine\dub.selections.json), and Go downloads the launcher's and installer's libraries
+   (walk, win, go-ole, golang.org/x/sys, govaluate, rsrc) and checks them against the go.sum files.
+Unpack this source zip to a folder without spaces in its path, for example
+C:\Hydro-build\SacrificeHydro-1.0.0-source.
+
+
+2. Build the engine (Hydro.exe)
+-------------------------------
+Open "x64 Native Tools Command Prompt for VS 2022" (in the Start menu, installed by step 1b) and run:
+
+    cd C:\Hydro-build\SacrificeHydro-1.0.0-source\engine
+    dub build -b release-debug -c application-audioformats
+
+This takes 5 to 15 minutes and needs a lot of memory. If it stops with an out-of-memory error, or
+your PC has less than 16 GB of RAM, tell the compiler to save memory (slower) and build again:
+
+    set DFLAGS=-lowmem
+    dub build -b release-debug -c application-audioformats
+
+The result is engine\3d.exe; it is shipped as Hydro.exe (the release tool renames it).
+  -b release-debug             optimised (-O3, inlining), with debug information, so that a crash
+                               report names the place in the code
+  -c application-audioformats  the configuration that plays the game's music and sounds with the
+                               audio-formats library (as the published Hydro.exe does)
+
+The engine needs SDL2.dll, OpenAL32.dll and freetype.dll next to it (runtime\ - the release tool
+copies them) and the Microsoft Visual C++ runtime, which nearly every Windows PC already has
+(otherwise: https://aka.ms/vs/17/release/vc_redist.x64.exe).
+
+
+3. Get the two published Manual downloads
+-----------------------------------------
+The release tool takes two things from the published downloads instead of making them again:
+  - the mod's creature and spell files (the "mods" folder): they are generated from your own copy
+    of Sacrifice by tools\kappagen and tools\sfx (see "The creature and spell files" below), so
+    they are taken from SacrificeHydro-1.0.0-Manual.zip;
+  - the HD texture builder of Hydro HD, which is Sacrifice HD's: SacrificeHD-1.1.1-Manual.zip
+    (Sacrifice HD has its own source download, SacrificeHD-1.1.1-source.zip).
+Download SacrificeHydro-1.0.0-Manual.zip and SacrificeHD-1.1.1-Manual.zip from the mods' Nexus
+Mods pages (Files tab) into, for example, C:\Hydro-build\downloads. Do not unzip them.
+
+
+4. Build the downloads
+----------------------
+Open a Command Prompt in this source folder's "release" folder and run (one line):
+
+    cd C:\Hydro-build\SacrificeHydro-1.0.0-source\release
+    go run . -engine ..\engine\3d.exe -assets C:\Hydro-build\downloads\SacrificeHydro-1.0.0-Manual.zip -sachd C:\Hydro-build\downloads\SacrificeHD-1.1.1-Manual.zip -source C:\Hydro-build\SacrificeHydro-1.0.0-source.zip -out C:\Hydro-build\out
+
+(-source is the zip of this source folder; the mod carries a copy of it in its "source" folder, as
+the GPL asks. Leave -source out if you do not need that copy.)
+
+It takes a minute or two (longer the first time, while Go downloads the libraries) and does this:
+  1. builds the launcher from launcher\ : first the small verinfo tool (installer\verinfo), which
+     writes the launcher's icon, manifest and version information into
+     launcher\rsrc_windows_amd64.syso, then, for 64-bit Windows (GOOS=windows, GOARCH=amd64,
+     CGO_ENABLED=0):
+         go build -trimpath -ldflags "-H windowsgui -s -w" -o "Sacrifice Hydro Launcher.exe" .
+  2. for Sacrifice Hydro and then Sacrifice Hydro HD, puts the mod's folder together:
+       Hydro.exe (your engine\3d.exe), the launcher, runtime\*.dll, package\hotkeys.txt,
+       package\settings.txt (Hydro HD: package\hd\settings.txt), package\licenses, the "mods"
+       folder from the Hydro Manual zip, the source zip, and README.txt (written by
+       tools\release\make_readme.py); Hydro HD also gets HDTextures\ (SacrificeHD.exe, esrgan\
+       and the Real-ESRGAN licences from the Sacrifice HD Manual zip, plus package\hd\prepare.bat
+       and package\hd\THIRD-PARTY.txt);
+  3. builds that download's installer from installer\ : edition.json is the download's file from
+     installer\editions\ plus the size of the mod's folder (without the source zip), the version
+     information goes into installer\rsrc_windows_amd64.syso, then
+         go build -trimpath -ldflags "-H windowsgui" -o "Install <name>.exe" .
+     The same program, named "Uninstall <name>.exe", is the uninstaller in the mod's folder;
+  4. makes the Setup zip (the installer, README.txt and the "files" folder) and the Manual zip
+     (the mod's folder only, to copy into the Sacrifice folder by hand);
+  5. prints the checksums of the programs it made.
+
+Result (in the -out folder):
+  SacrificeHydro-1.0.0-Setup.zip, SacrificeHydro-1.0.0-Manual.zip,
+  SacrificeHydroHD-1.0.0-Setup.zip, SacrificeHydroHD-1.0.0-Manual.zip
+  work\     the same, unzipped (can be deleted)
+
+
+5. Check the result
+-------------------
+- The launcher and the two installers: compare the checksums the tool prints with CHECKSUMS.txt.
+  With Go 1.24.7 they are identical:
+      Sacrifice Hydro Launcher.exe, Install Sacrifice Hydro.exe, Install Sacrifice Hydro HD.exe
+  (The installers contain the size of the mod's folder, so they match only if your Hydro.exe has
+  the same size as the published one; with a different Hydro.exe only those two differ.)
+- Hydro.exe: a D program contains the folders it was built in, the time it was built and the
+  path of its debug file, so your build will not be byte for byte the published one, and its
+  checksum will differ. To check that it is built from the same code:
+    * the published Hydro.exe was built from engine commit
+          6b0082fd0384ce055ddc985b8824bb0fd933ea61
+      (engine\.git\refs\heads\hydro). Start the game once; the first line of SacEngine.out.txt
+      (next to Hydro.exe) says "SacEngine build <date> <time>, commit 6b0082fd...". Yours says
+      the same commit, because it is read from engine\.git while building;
+    * the multiplayer lobby compares the commit of both players' engines and refuses to start
+      when they differ, so a Hydro.exe built from this source can join games with the published
+      one;
+    * hydro-engine-changes.patch and hydro-dagon-changes.patch show every change made to
+      sacengine and dagon; apply them to a fresh clone of https://github.com/tg-2/sacengine at
+      commit 181d1ce (with its dagon submodule at 3ccbb7a) and compare with engine\.
+- Every other file of the downloads is the same as in the published ones; CHECKSUMS.txt lists
+  them all. Check any single file on Windows with:   certutil -hashfile <file> SHA256
+- The zips themselves differ from the published ones only in the time stamps inside them.
+
+
+Building the parts by hand
+--------------------------
+Only the launcher (in the launcher folder):
+    cd ..\installer\verinfo
+    go build -o ..\..\verinfo.exe .
+    cd ..\..\launcher
+    python ..\installer\mkver.py "Sacrifice Hydro" 1.0.0 "Sacrifice Hydro launcher" "Sacrifice Hydro Launcher.exe" vi.json hydro.ico launcher.manifest
+    ..\verinfo.exe vi.json rsrc_windows_amd64.syso
+    set GOOS=windows
+    set GOARCH=amd64
+    set CGO_ENABLED=0
+    go build -trimpath -ldflags "-H windowsgui -s -w" -o "Sacrifice Hydro Launcher.exe" .
+The launcher starts Hydro.exe from its own folder and keeps its options in launcher.ini and
+settings.txt there.
+
+Only an installer (in the installer folder; edition.json holds the settings of one download, by
+default Sacrifice Hydro's):
+    copy editions\hydrohd.json edition.json        (for Hydro HD)
+    python mkver.py "Sacrifice Hydro HD" 1.0.0 "Sacrifice Hydro HD setup" "Install Sacrifice Hydro HD.exe" vi.json hydro.ico setup.manifest
+    ..\verinfo.exe vi.json rsrc_windows_amd64.syso
+    set GOOS=windows
+    set GOARCH=amd64
+    go build -trimpath -ldflags "-H windowsgui" -o "Install Sacrifice Hydro HD.exe" .
+The installer needs the "files" folder next to it (see step 4 for its layout).
+
+Tests of the installer's install / update / uninstall logic (they run on any system):
+    cd installer
+    go test .
+
+Building the engine on Linux for Windows (as the published Hydro.exe was): unpack both the Linux
+and the Windows LDC 1.41.0 packages next to each other, add the "x86_64-.*-windows-msvc" section
+shown in engine\ldc2-windows.sh to the Linux package's etc\ldc2.conf, then in engine\:
+    DFLAGS=-lowmem dub build -b release-debug -c application-audioformats --arch=x86_64-windows-msvc
+
+
+The creature and spell files
+----------------------------
+The Hydro creatures are new models built on the skeletons and animations of the original
+creatures, so their files are generated from your own copy of Sacrifice rather than shipped as
+source. If you want to change them:
+  - tools\kappagen (Go) builds the creature models. In tools\kappagen:
+        go run . -data "C:\GOG Games\Sacrifice\data" -gen C:\Hydro-build\creatures
+    (-only tidekin,leviathan builds just those). The d_*.go files hold the design of each
+    creature (body parts, sizes, colours), creature.go / abil.go their stats and abilities;
+    "go run . -h" lists the other commands (contact sheets, checks, previews).
+  - tools\sfx (Python, with numpy and Pillow: pip install numpy pillow): the creature and spell
+    icons (make_creature_icons.py, make_spell_icons.py), the spell effects (make_*_fx.py), the
+    manalith (make_manalith.py) and the sounds (make_voices.py, synth_fx.py; the spoken lines,
+    make_lines.py, also need the piper text-to-speech program and ffmpeg).
+  - The game rules of each creature and spell (costs, damage, speed, animations) are plain JSON
+    files in the "mods" folder (creature.json / spell.json), read by the engine at start; they can
+    be edited directly.
+Models made again this way work the same, but are not byte for byte the published ones (their
+mesh order differs), which is why the release tool takes the "mods" folder from the published
+Manual download.

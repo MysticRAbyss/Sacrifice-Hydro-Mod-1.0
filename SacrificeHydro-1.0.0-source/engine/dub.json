@@ -1,0 +1,37 @@
+{
+	"name": "3d",
+	"authors": [
+		"tg"
+	],
+	"description": "SacEngine.",
+	"copyright": "Copyright © 2018, tg",
+	"license": "GPL 3.0",
+	
+	"buildRequirements": ["requireBoundsCheck","requireContracts"],
+	"stringImportPaths": [".git"],
+
+	"dependencies": {
+		"derelict-ft": "~>2.0.0-beta.2",
+		"derelict-al": "~>2.0.0-beta.2",
+		"dlib": {"path": "dlib", "version": "*"},
+		"dagon": {"path": "dagon", "version": "*"},
+	},
+	
+	"configurations": [
+		{
+			"name": "application",
+			"targetType": "executable",
+			"dependencies": {
+				"derelict-mpg123": "~>0.1.2",
+			},
+			"versions": ["SacEngineMPG123"]
+		}, {
+			"name": "application-audioformats",
+			"targetType": "executable",
+			"dependencies": {
+				"audio-formats":  "~>3.0.2",
+			},
+			"versions": ["SacEngineAudioFormats","decodeMP3"]
+		}
+	]
+}

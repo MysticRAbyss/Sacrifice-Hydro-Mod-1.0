@@ -1,0 +1,54 @@
+{
+  "tag": "mshr",
+  "model": "mshr",
+  "name": "Mantis Shrimp",
+  "god": "hydro",
+  "base": "aarc",
+  "level": 2,
+  "rawUV": true,
+  "stats": {
+    "spellOrder": 230,
+    "souls": 2,
+    "health": 1235,
+    "meleeStrength": 145,
+    "manaCost": 600,
+    "runningSpeed": 1125,
+    "rangedAccuracy": 400,
+    "regeneration": 1250
+  },
+  "abilityNames": {
+    "atic": "Slowing Bolt"
+  },
+  "sounds": {
+    "selected": [
+      "mantisshrimp/selected1.wav",
+      "mantisshrimp/selected2.wav"
+    ],
+    "annoyed": [
+      "mantisshrimp/annoyed1.wav"
+    ],
+    "moving": [
+      "mantisshrimp/moving1.wav",
+      "mantisshrimp/moving2.wav"
+    ],
+    "attacking": [
+      "mantisshrimp/attacking1.wav",
+      "mantisshrimp/attacking2.wav"
+    ],
+    "damaged": [
+      "mantisshrimp/damaged1.wav",
+      "mantisshrimp/damaged2.wav"
+    ],
+    "death": [
+      "mantisshrimp/death1.wav"
+    ],
+    "melee": [
+      "mantisshrimp/attacking1.wav",
+      "mantisshrimp/attacking2.wav"
+    ],
+    "rescued": [
+      "mantisshrimp/selected1.wav",
+      "mantisshrimp/selected2.wav"
+    ]
+  }
+}

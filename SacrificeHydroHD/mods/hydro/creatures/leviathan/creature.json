@@ -1,0 +1,68 @@
+{
+ "tag": "lvtn",
+ "model": "lvtn",
+ "name": "Leviathan",
+ "god": "hydro",
+ "base": "bdrg",
+ "level": 9,
+ "rawUV": true,
+ "stats": {
+  "spellOrder": 930,
+  "souls": 5,
+  "health": 5200,
+  "meleeStrength": 800,
+  "manaCost": 1900,
+  "ability1": "mlst",
+  "ability2": "",
+  "runningSpeed": 1250,
+  "flyingSpeed": 1500,
+  "rangedAccuracy": 300,
+  "regeneration": 1250
+ },
+ "abilityNames": {
+  "abdr": "Tidal Breath",
+  "mlst": "Maelstrom"
+ },
+ "sounds": {
+  "selected": [
+   "leviathan/selected1.wav",
+   "leviathan/selected2.wav",
+   "leviathan/line_selected1.wav",
+   "leviathan/line_selected2.wav"
+  ],
+  "annoyed": [
+   "leviathan/annoyed1.wav",
+   "leviathan/line_annoyed1.wav"
+  ],
+  "moving": [
+   "leviathan/moving1.wav",
+   "leviathan/moving2.wav",
+   "leviathan/line_moving1.wav",
+   "leviathan/line_moving2.wav"
+  ],
+  "attacking": [
+   "leviathan/attacking1.wav",
+   "leviathan/attacking2.wav",
+   "leviathan/line_attacking1.wav",
+   "leviathan/line_attacking2.wav"
+  ],
+  "damaged": [
+   "leviathan/damaged1.wav",
+   "leviathan/damaged2.wav",
+   "leviathan/line_damaged1.wav"
+  ],
+  "death": [
+   "leviathan/death1.wav",
+   "leviathan/line_death1.wav"
+  ],
+  "melee": [
+   "leviathan/attacking1.wav",
+   "leviathan/attacking2.wav"
+  ],
+  "rescued": [
+   "leviathan/selected1.wav",
+   "leviathan/selected2.wav"
+  ]
+ },
+ "startsFlying": true
+}

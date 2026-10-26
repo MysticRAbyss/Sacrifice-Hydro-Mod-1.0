@@ -1,0 +1,61 @@
+{
+ "tag": "pufy",
+ "model": "pufy",
+ "name": "Puffy",
+ "god": "hydro",
+ "base": "sbob",
+ "level": 5,
+ "rawUV": true,
+ "stats": {
+  "spellOrder": 530,
+  "souls": 3,
+  "health": 1900,
+  "meleeStrength": 200,
+  "manaCost": 1000,
+  "flyingSpeed": 1100,
+  "rangedAccuracy": 100,
+  "ability0": "fbow",
+  "regeneration": 1250,
+  "ability1": "tspn"
+ },
+ "abilityNames": {
+  "fbow": "Water Bolt",
+  "tspn": "Toxic Spines"
+ },
+ "sounds": {
+  "selected": [
+   "puffy/selected1.wav",
+   "puffy/selected2.wav"
+  ],
+  "annoyed": [
+   "puffy/annoyed1.wav"
+  ],
+  "moving": [
+   "puffy/moving1.wav",
+   "puffy/moving2.wav"
+  ],
+  "attacking": [
+   "puffy/attacking1.wav",
+   "puffy/attacking2.wav"
+  ],
+  "damaged": [
+   "puffy/damaged1.wav",
+   "puffy/damaged2.wav"
+  ],
+  "death": [
+   "puffy/death1.wav"
+  ],
+  "melee": [
+   "puffy/attacking1.wav",
+   "puffy/attacking2.wav"
+  ],
+  "rescued": [
+   "puffy/selected1.wav",
+   "puffy/selected2.wav"
+  ]
+ },
+ "rangedAttack": {
+  "amount": 400
+ },
+ "boltProjectile": true
+}

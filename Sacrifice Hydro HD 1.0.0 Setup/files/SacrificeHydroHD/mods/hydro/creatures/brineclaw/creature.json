@@ -1,0 +1,55 @@
+{
+  "tag": "brcl",
+  "model": "brcl",
+  "name": "Brineclaw",
+  "god": "hydro",
+  "base": "farc",
+  "level": 3,
+  "rawUV": true,
+  "stats": {
+    "spellOrder": 330,
+    "souls": 2,
+    "health": 1800,
+    "meleeStrength": 280,
+    "manaCost": 700,
+    "runningSpeed": 1150,
+    "ability0": "alsp",
+    "rangedAccuracy": 0,
+    "regeneration": 1250
+  },
+  "abilityNames": {
+    "alsp": "Crushing Grip"
+  },
+  "sounds": {
+    "selected": [
+      "brineclaw/selected1.wav",
+      "brineclaw/selected2.wav"
+    ],
+    "annoyed": [
+      "brineclaw/annoyed1.wav"
+    ],
+    "moving": [
+      "brineclaw/moving1.wav",
+      "brineclaw/moving2.wav"
+    ],
+    "attacking": [
+      "brineclaw/attacking1.wav",
+      "brineclaw/attacking2.wav"
+    ],
+    "damaged": [
+      "brineclaw/damaged1.wav",
+      "brineclaw/damaged2.wav"
+    ],
+    "death": [
+      "brineclaw/death1.wav"
+    ],
+    "melee": [
+      "brineclaw/attacking1.wav",
+      "brineclaw/attacking2.wav"
+    ],
+    "rescued": [
+      "brineclaw/selected1.wav",
+      "brineclaw/selected2.wav"
+    ]
+  }
+}

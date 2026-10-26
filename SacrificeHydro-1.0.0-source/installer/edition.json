@@ -1,0 +1,3 @@
+{"id":"SacrificeHydro","title":"Sacrifice Hydro","version":"1.0.0","modFolder":"SacrificeHydro",
+ "launcher":"SacrificeHydro/Sacrifice Hydro Launcher.exe","uninstaller":"SacrificeHydro/Uninstall Sacrifice Hydro.exe",
+ "userFiles":["settings.txt","hotkeys.txt","launcher.ini"],"notes":[]}

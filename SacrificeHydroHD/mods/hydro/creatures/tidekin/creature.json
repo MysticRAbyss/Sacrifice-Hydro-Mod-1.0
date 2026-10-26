@@ -1,0 +1,73 @@
+{
+  "tag": "tidk",
+  "model": "tidk",
+  "name": "Tidekin",
+  "god": "hydro",
+  "base": "klap",
+  "level": 1,
+  "rawUV": true,
+  "stats": {
+    "spellOrder": 130,
+    "souls": 1,
+    "health": 800,
+    "meleeStrength": 160,
+    "manaCost": 300,
+    "regeneration": 1250,
+    "runningSpeed": 1150,
+    "meleeAccuracy": 1000,
+    "meleeEvasion": 1000,
+    "rangedAccuracy": 0,
+    "meleeResistance": 1000,
+    "directRangedResistance": 900,
+    "splashRangedResistance": 900,
+    "unknown16": 1000,
+    "sightRange": 1000,
+    "sightFov": 1000,
+    "mana": 100,
+    "ability0": "shup"
+  },
+  "abilityNames": {
+    "shup": "Shell Up"
+  },
+  "sounds": {
+    "selected": [
+      "tidekin/selected1.wav",
+      "tidekin/selected2.wav",
+      "tidekin/line_selected1.wav",
+      "tidekin/line_selected2.wav"
+    ],
+    "annoyed": [
+      "tidekin/annoyed1.wav",
+      "tidekin/line_annoyed1.wav"
+    ],
+    "moving": [
+      "tidekin/moving1.wav",
+      "tidekin/moving2.wav",
+      "tidekin/line_moving1.wav",
+      "tidekin/line_moving2.wav"
+    ],
+    "attacking": [
+      "tidekin/attacking1.wav",
+      "tidekin/attacking2.wav",
+      "tidekin/line_attacking1.wav",
+      "tidekin/line_attacking2.wav"
+    ],
+    "damaged": [
+      "tidekin/damaged1.wav",
+      "tidekin/damaged2.wav",
+      "tidekin/line_damaged1.wav"
+    ],
+    "death": [
+      "tidekin/death1.wav",
+      "tidekin/line_death1.wav"
+    ],
+    "melee": [
+      "tidekin/attacking1.wav",
+      "tidekin/attacking2.wav"
+    ],
+    "rescued": [
+      "tidekin/selected1.wav",
+      "tidekin/selected2.wav"
+    ]
+  }
+}

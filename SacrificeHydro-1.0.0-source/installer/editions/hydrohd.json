@@ -1,0 +1,4 @@
+{"id":"SacrificeHydroHD","title":"Sacrifice Hydro HD","version":"1.0.0","modFolder":"SacrificeHydroHD",
+ "launcher":"SacrificeHydroHD/Sacrifice Hydro Launcher.exe","uninstaller":"SacrificeHydroHD/Uninstall Sacrifice Hydro HD.exe",
+ "hdCache":true,"userFiles":["settings.txt","hotkeys.txt","launcher.ini"],
+ "notes":["The first time you press Play it builds the HD textures from your copy of the game (a few minutes, once)."]}

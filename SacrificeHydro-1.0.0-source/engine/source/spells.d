@@ -1,0 +1,297 @@
+// copyright © tg
+// distributed under the terms of the gplv3 license
+// https://www.gnu.org/licenses/gpl-3.0.txt
+
+import util;
+import animations;
+import std.exception, std.string;
+
+enum SpellType:uint{
+	creature=2,
+	spell=4,
+	wizard=8,
+	structure=16,
+}
+
+struct Cre8{
+	char[4] id0;
+	SpellType spellType;
+	char[4] name;
+	char[4] icon;
+	uint unknown1; // unused
+	uint cooldown;
+	uint manaCost;
+	float range; // unused
+	uint unknown5; // unused. but it seems spell fails to cast if unknown5>5.
+	ushort minCastingTime; // casting time floor from level scaling: castFrames=castingTime+(minCastingTime-castingTime)*0.2*clamp(level-spellLevel,0,5). equals castingTime/2 in all data.
+	ushort castingTime;
+	ushort spellOrder;
+	ushort unknown9; // unused?
+	ushort meleeAccuracy; // attacker weight in the melee hit roll: P(full hit)=meleeAccuracy/(meleeAccuracy+defender's meleeEvasion/facing), facing=1.5+0.5*dot(facing directions). mutated by spells (e.g. slime).
+	ushort meleeEvasion; // defender weight in the melee hit roll, effectively halved when attacked from behind.
+	ushort aggressiveness;// if 0, creatures don't attack automatically
+	ushort runningSpeed;
+	ushort flyingSpeed;
+	ushort health;
+	ushort regeneration;
+	ushort drain;
+	ushort rangedAccuracy;
+	ushort meleeResistance;
+	ushort directSpellResistance;
+	ushort splashSpellResistance;
+	ushort directRangedResistance;
+	ushort splashRangedResistance;
+	ushort unknown15; // seems to be 0 for everything but flying melee
+	ushort unknown16; // some multiplier?
+	ushort sightRange; // sight radius = sightRange*0.1
+	ushort sightFov; // field of view half-angle = pi/4*sqrt(sightFov/1000).
+	ushort god;
+	ushort souls;
+	ushort unknown20; // some multiplier?
+	uint unknown21; // unused?
+	char[4] ability0; // refers to @ABI
+	char[4] ability1;
+	uint[6] unknown22; // unused?
+	char[4] ability2;
+	uint unknown23;
+	uint meleeStrength; // moderately small number
+	uint mana; // "
+	char[4] behaviorFSM; // behavior FSM tag
+	char[4] creatureType;
+	char[4] saxsModel;
+	uint behaviorFlags; // bit 6: hero. bit 8: villagers. bit 9: can fly. bit 13: troll, sac doctor, familiar, mentor. bit 14: has personal-disposition grudge mask. bit 15: alarm broadcast to same-side within 100.0
+	uint numSSETs;
+	char[4] meleeSSET; // refers to SSET files
+	char[4] creatureSSET;
+	char[4] kind; // may refer to subfolder with creature name
+	uint unknown31; // unused?
+	Animations animations;
+	uint passiveType;
+	uint passiveFlags;
+	char[4] passiveAbility;
+	uint[2] unknown37;
+	char[4] passiveAbility2;
+	uint[18] unknown38; // unused?
+}
+static assert(Cre8.sizeof==528);
+
+Cre8 parseCre8(ubyte[] data){
+	enforce(data.length==Cre8.sizeof);
+	return *cast(Cre8*)data.ptr;
+}
+
+Cre8 loadCre8(string filename){
+	enforce(filename.endsWith("CRE8"));
+	return parseCre8(readFile(filename));
+}
+
+struct Wizd{
+	char[4] id0;
+	SpellType spellType;
+	char[4] name;
+	char[4] icon;
+	uint[6] unknown0; // unused?
+	uint unknown1; // differs by wizard, some number above 100
+	ushort meleeAccuracy=1250; // wizard stat block
+	ushort meleeEvasion=1250; // see Cre8.meleeAccuracy/meleeEvasion for the melee hit roll
+	ushort aggressiveness=1000; // if 0, creatures don't attack automatically
+	ushort runningSpeed=1000;
+	ushort flyingSpeed=0;
+	ushort health=1500;
+	ushort regeneration=1000;
+	ushort drain=0;
+	ushort rangedAccuracy=0;
+	ushort meleeResistance;
+	ushort directSpellResistance;
+	ushort splashSpellResistance;
+	ushort directRangedResistance;
+	ushort splashRangedResistance;
+	ushort unknown15; // seems to be 0 for everything but flying melee
+	ushort unknown16; // some multiplier?
+	ushort unknown17; // some multiplier?
+	ushort unknown18; // some multiplier?
+	ushort unknown19; // a small number
+	ushort souls=0;
+	ushort unknown20; // some multiplier?
+	uint unknown21; // unused?
+	char[4] ability1; // refers to @ABI
+	char[4] ability2;
+	uint[6] unknown22; // unused?
+	char[4] ability3;
+	uint unknown23;
+	uint unknown24; // moderately small number
+	uint mana;
+	char[4] behaviorFSM; // behavior FSM tag
+	char[4] creatureType;
+	char[4] saxsModel;
+	uint behaviorFlags;
+	uint unknown30;
+	char[4] wizardSSET; // refers to SSET files
+	char[4] meleeSSET1;
+	char[4] meleeSSET2;
+	char[4] kind; // may refer to subfolder with creature name
+	Animations animations;
+	uint[24] unknown36; // unused
+	uint unknown37;
+	uint unknown38;
+	uint unknown39;
+	uint unknown40;
+	uint unknown41;
+	uint unknown42;
+	uint unknown43;
+	uint unknown44; // unused
+	uint unknown45; // unused
+	uint unknown46; // unused
+	char[4] unknown47;
+	char[4] unknown48;
+	char[4] unknown49;
+	char[4] unknown50;
+	char[4] unknown51;
+	char[4] unknown52;
+	char[4] unknown53;
+	char[4] unknown54;
+	char[4] unknown55;
+	uint[59] unknown; // unused?
+}
+static assert(Wizd.sizeof==840);
+
+Wizd parseWizd(ubyte[] data){
+	enforce(data.length==Wizd.sizeof);
+	return *cast(Wizd*)data.ptr;
+}
+
+Wizd loadWizd(string filename){
+	enforce(filename.endsWith("WIZD"));
+	return parseWizd(readFile(filename));
+}
+
+enum SpelFlags:uint{
+	targetSelf=0,
+	targetWizards=1<<0,
+	targetSouls=1<<1,
+	targetCreatures=1<<2,
+	targetCorpses=1<<3,
+	targetStructures=1<<4,
+	onlyManafounts=1<<11,
+	onlyAlly=1<<12,
+	disallowAlly=1<<13,
+	targetGround=1<<14,
+	disallowFlying=1<<16,
+	requiresLandAnchor=1<<17, // volcano only
+	onlyCreatures=1<<18, // redundant?
+	onlyOwned=1<<19,
+	disallowHero=1<<20,
+}
+
+enum SpelFlags1:ushort{
+	none=0,
+	basicAttackSpell=1<<0,
+	basicAttackSpell2=1<<1,
+	shield=1<<4,
+	unknown5=1<<5, // dead
+	areaDamage=1<<6, // modifier on damage
+	protect=1<<10,
+	crowdControl=1<<11,
+	attackAbility=1<<12, // damage|attackAbility|crowdControl
+	supportAbility=1<<13, // heal|supportAbility|protect
+	damage=1<<14,
+	heal=1<<15,
+}
+
+enum SpelFlags2:uint{
+	nearBuilding=1<<8,
+	nearEnemyAltar=1<<9,
+	connectedToConversion=1<<10,
+	castAnimation2=1<<18,
+	untargetedCast=1<<19,
+	aiCastable=1<<23,
+	innateAttack=1<<24,
+	stationaryCasting=1<<25,
+}
+
+
+struct Spel{
+	char[4] id0;
+	SpellType spellType;
+	char[4] name;
+	char[4] icon;
+	uint unknown1; // only used for wizards
+	uint cooldown;
+	uint manaCost;
+	float range;
+	SpelFlags flags;
+	ushort minCastingTime; // casting time floor from level scaling: castFrames=castingTime+(minCastingTime-castingTime)*0.2*clamp(level-spellLevel,0,5)
+	ushort castingTime;
+	ushort spellOrder;
+	ushort unknown9; // ?
+	char[4][4] exclusionTags; // target is rejected if it has an active spell effect with any of these tags
+	float damageRange;
+	uint unknown13; // unused?
+	ushort amount; // e.g. damage or amount of healed hitpoints
+	ushort unknown14; // unused?
+	float speed;
+	float acceleration;
+	float duration;
+	float effectRange;
+	ushort unknown16; // unused?
+	SpelFlags1 flags1;
+	SpelFlags2 flags2;
+	uint amount2; // seems to be the same as amount most of the time
+	uint amount3; // e.g., number of vines spawned by meanstalks, number of creatures targeted by death
+	uint unknown21; // unused?
+	uint unknown22; // unused?
+	ushort soundFlags; // unclear how to interpret
+	char[4] sound; // TODO: how to read this?
+	struct Sound{
+		ushort flags;
+		char[4] sound;
+	}
+	Sound[4] sounds; // TODO: how to read this?
+	struct Arguments{
+		char[4] type;
+		char[4] what;
+	}
+	Arguments[8] args;
+	char[36] aiProc;
+	char[36] proc1;
+	char[36] proc2;
+}
+static assert(Spel.sizeof==314+2); // 2 padding bytes
+
+Spel parseSpel(ubyte[] data){
+	enforce(data.length<=Spel.sizeof);
+	data.length=Spel.sizeof;
+	return *cast(Spel*)data.ptr;
+}
+
+Spel loadSpel(string filename){
+	enforce(filename.endsWith("SPEL"));
+	return parseSpel(readFile(filename));
+}
+
+struct Strc{
+	char[4] id0;
+	SpellType spellType;
+	char[4] name;
+	char[4] icon;
+	uint unknown1; // unused?
+	uint cooldown;
+	uint manaCost;
+	float range;
+	SpelFlags flags;
+	ushort minCastingTime; // casting time floor from level scaling: castFrames=castingTime+(minCastingTime-castingTime)*0.2*clamp(level-spellLevel,0,5)
+	ushort castingTime;
+	ushort spellOrder;
+	ushort unknown9; // ?
+	char[4][5] structure;
+}
+
+Strc parseStrc(ubyte[] data){
+	enforce(data.length==Strc.sizeof);
+	return *cast(Strc*)data.ptr;
+}
+
+Strc loadStrc(string filename){
+	enforce(filename.endsWith("STRC"));
+	return parseStrc(readFile(filename));
+}

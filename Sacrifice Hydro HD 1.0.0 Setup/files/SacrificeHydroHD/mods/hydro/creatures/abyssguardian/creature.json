@@ -1,0 +1,67 @@
+{
+ "tag": "abgd",
+ "model": "abgd",
+ "name": "Abyss Guardian",
+ "god": "hydro",
+ "base": "estm",
+ "level": 7,
+ "rawUV": true,
+ "stats": {
+  "spellOrder": 730,
+  "souls": 4,
+  "health": 4500,
+  "meleeStrength": 700,
+  "manaCost": 1300,
+  "runningSpeed": 500,
+  "regeneration": 1250,
+  "creatureSSET": "trol"
+ },
+ "abilityNames": {
+  "quak": "Tidal Slam"
+ },
+ "animationSlots": {
+  "22": 11,
+  "56": 1
+ },
+ "sounds": {
+  "selected": [
+   "abyssguardian/selected1.wav",
+   "abyssguardian/selected2.wav",
+   "abyssguardian/line_selected1.wav",
+   "abyssguardian/line_selected2.wav"
+  ],
+  "annoyed": [
+   "abyssguardian/annoyed1.wav",
+   "abyssguardian/line_annoyed1.wav"
+  ],
+  "moving": [
+   "abyssguardian/moving1.wav",
+   "abyssguardian/moving2.wav",
+   "abyssguardian/line_moving1.wav"
+  ],
+  "attacking": [
+   "abyssguardian/attacking1.wav",
+   "abyssguardian/attacking2.wav",
+   "abyssguardian/attacking3.wav",
+   "abyssguardian/line_attacking1.wav",
+   "abyssguardian/line_attacking2.wav"
+  ],
+  "damaged": [
+   "abyssguardian/damaged1.wav",
+   "abyssguardian/damaged2.wav"
+  ],
+  "death": [
+   "abyssguardian/death1.wav",
+   "abyssguardian/line_death1.wav"
+  ],
+  "melee": [
+   "abyssguardian/attacking1.wav",
+   "abyssguardian/attacking2.wav",
+   "abyssguardian/attacking3.wav"
+  ],
+  "rescued": [
+   "abyssguardian/selected1.wav",
+   "abyssguardian/selected2.wav"
+  ]
+ }
+}
